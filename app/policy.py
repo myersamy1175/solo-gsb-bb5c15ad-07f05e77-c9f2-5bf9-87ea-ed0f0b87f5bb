@@ -12,12 +12,17 @@ The module also hosts three scope-based consumers of the same primitives:
 ``audit_rules`` (per-entry impact classification inside one scope) and
 ``minimize_policy`` (minimum-cardinality equivalent rule subset inside one
 scope), plus ``allocate`` (lexicographically smallest non-overlapping subnet
-assignment inside one scope, avoiding occupied CIDRs).
+assignment inside one scope, avoiding occupied CIDRs) and ``anonymize``
+(prefix-preserving keyed HMAC anonymization of bare addresses and strict
+CIDRs for safe sharing of address lists).
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
+import re
 from collections.abc import Iterable, Sequence
 from typing import TypeAlias, Union
 
@@ -62,6 +67,42 @@ def parse_address(value: object) -> Address:
     if "/" in text:
         raise ValueError(f"{value!r} is an address with a prefix length")
     return ipaddress.ip_address(text)
+
+
+#: Exactly 64 hexadecimal characters (32 bytes / 256 bits), case-insensitive.
+KEY_HEX_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+
+
+def parse_key_hex(value: object) -> bytes:
+    """Decode the 64-hex-character (256-bit) ``key_hex`` into raw key bytes.
+
+    Any non-string, wrong-length or non-hexadecimal input raises
+    :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"key_hex must be a string, got {type(value).__name__}"
+        )
+    text = value.strip()
+    if KEY_HEX_RE.fullmatch(text) is None:
+        raise ValueError(
+            "key_hex must be exactly 64 hexadecimal characters (256 bits)"
+        )
+    return bytes.fromhex(text)
+
+
+def parse_strict_cidr(value: object) -> Network:
+    """Parse a CIDR string carrying an explicit prefix length, strictly.
+
+    Unlike :func:`parse_network`, a bare address (``10.0.0.1``) is rejected:
+    the ``cidrs`` input of ``/anonymize`` accepts explicit CIDR notation only.
+    Any invalid input raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"CIDR must be a string, got {type(value).__name__}")
+    if "/" not in value.strip():
+        raise ValueError(f"{value!r} is missing a prefix length (expected a.b.c.d/p)")
+    return parse_network(value)
 
 
 def _sort_key(network: Network) -> tuple[bytes, int]:
@@ -1092,4 +1133,101 @@ def allocate(
         "remaining_addresses": str(
             sum(net.num_addresses for net in remaining)
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# anonymize: prefix-preserving, keyed HMAC anonymization of bare addresses and
+# strict CIDRs (Crypto-PAn-style bitwise prefix cipher).
+# ---------------------------------------------------------------------------
+
+#: HMAC domain-separation tag per address family (IPv4 -> 0x04, IPv6 -> 0x06).
+_ANON_FAMILY_TAG: dict[type, int] = {
+    ipaddress.IPv4Address: 4,
+    ipaddress.IPv6Address: 6,
+}
+
+#: Address width in bits per address family.
+_ANON_WIDTH: dict[type, int] = {
+    ipaddress.IPv4Address: 32,
+    ipaddress.IPv6Address: 128,
+}
+
+
+def _anonymize_address(address: Address, key: bytes) -> Address:
+    """Anonymize one address bit by bit in network (MSB-first) bit order.
+
+    For bit position ``i`` (0-based from the most significant bit), the HMAC
+    message is the address-family tag byte, the single current-position byte
+    ``i``, followed by the *original* bits that precede position ``i`` right
+    zero-padded to the full address width (4 bytes for IPv4, 16 for IPv6).
+    The most significant bit of the HMAC-SHA256 digest is XORed onto the
+    current original bit.
+
+    Because the pad at every position contains only original prefix bits, two
+    addresses sharing a prefix take identical HMAC decisions all through that
+    prefix (prefix preservation); at each prefix node the two outgoing bits
+    stay distinct under the fixed XOR mask, so the whole-family mapping is a
+    bijection; and with a fixed key the same address always maps identically.
+    """
+    family = type(address)
+    width = _ANON_WIDTH[family]
+    packed = address.packed
+    output = bytearray(len(packed))
+    # Prefix of *original* bits processed so far, right zero-padded to width:
+    # at position i its top i bits equal the source's top i bits.
+    prefix = bytearray(len(packed))
+    family_tag = _ANON_FAMILY_TAG[family]
+    for i in range(width):
+        source_byte = packed[i >> 3]
+        bit_index = 7 - (i & 7)
+        original_bit = (source_byte >> bit_index) & 1
+        message = bytes([family_tag, i]) + bytes(prefix)
+        digest = hmac.new(key, message, hashlib.sha256).digest()
+        mask_bit = digest[0] >> 7
+        output[i >> 3] |= (original_bit ^ mask_bit) << bit_index
+        prefix[i >> 3] |= original_bit << bit_index
+    return family(bytes(output))
+
+
+def anonymize(
+    key_hex_raw: str,
+    address_raw: Sequence[str],
+    cidr_raw: Sequence[str],
+) -> dict:
+    """Anonymize bare addresses and strict CIDRs under one 256-bit key.
+
+    Addresses are transformed by :func:`_anonymize_address`.  Each CIDR is
+    parsed strictly (host bits must already be zero), its network address is
+    anonymized, and host bits are cleared again at the original prefix length
+    so the result is a canonical network.  Each output list keeps its input
+    order; IPv4 and IPv6 entries may be mixed.
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema):
+    ``key_hex_raw`` is 64 hex characters, addresses are bare and CIDRs carry
+    explicit prefix lengths with zero host bits.  A malformed value raises
+    :class:`ValueError`.
+    """
+    key = parse_key_hex(key_hex_raw)
+
+    anonymized_addresses: list[str] = []
+    for item in address_raw:
+        address = parse_address(item)
+        anonymized_addresses.append(str(_anonymize_address(address, key)))
+
+    anonymized_cidrs: list[str] = []
+    for item in cidr_raw:
+        network = parse_strict_cidr(item)
+        anon_network_address = _anonymize_address(network.network_address, key)
+        # Anonymization can flip host bits even when the source network
+        # address had none, so re-mask to the original prefix length for a
+        # canonical network (strict=False performs that masking).
+        anon_network = type(network)(
+            (anon_network_address, network.prefixlen), strict=False
+        )
+        anonymized_cidrs.append(str(anon_network))
+
+    return {
+        "addresses": anonymized_addresses,
+        "cidrs": anonymized_cidrs,
     }

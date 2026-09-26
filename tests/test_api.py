@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -1031,3 +1032,163 @@ def test_allocate_is_documented_in_openapi():
     assert set(schema["properties"]) == {
         "allocations", "remaining", "remaining_addresses",
     }
+
+
+# --------------------------------------------------------------------------
+# POST /anonymize
+# --------------------------------------------------------------------------
+
+KEY = "0123456789abcdef" * 4
+
+
+def test_anonymize_basic_v4_v6_addresses_and_cidrs():
+    response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": KEY,
+            "addresses": [
+                "10.0.0.1", "10.0.0.2", "192.0.2.1", "2001:db8::1",
+            ],
+            "cidrs": ["10.0.0.0/24", "2001:db8::/32"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "addresses": [
+            "77.249.170.48",
+            "77.249.170.51",
+            "236.60.54.68",
+            "d5af:46c8:beb3:e56d:c681:ca26:c4a4:9e2a",
+        ],
+        "cidrs": ["77.249.170.0/24", "d5af:46c8::/32"],
+    }
+
+
+def test_anonymize_is_stable_and_prefix_preserving():
+    payload = {
+        "key_hex": KEY,
+        "addresses": ["10.0.0.1", "10.0.0.2"],
+        "cidrs": [],
+    }
+    first = client.post("/anonymize", json=payload).json()
+    second = client.post("/anonymize", json=payload).json()
+    assert first == second
+    # The two inputs share 10.0.0.0/30 (last octets 1 and 2 differ at bit 6):
+    # outputs 77.249.170.48 and .51 share the same /30 prefix too.
+    assert first["addresses"] == ["77.249.170.48", "77.249.170.51"]
+
+
+def test_anonymize_defaults_to_empty_lists():
+    response = client.post("/anonymize", json={"key_hex": KEY})
+    assert response.status_code == 200
+    assert response.json() == {"addresses": [], "cidrs": []}
+
+
+def test_anonymize_preserves_input_order():
+    response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": KEY,
+            "addresses": ["2001:db8::1", "10.0.0.1", "10.0.0.2"],
+            "cidrs": ["2001:db8::/32", "10.0.0.0/24"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["addresses"] == [
+        "d5af:46c8:beb3:e56d:c681:ca26:c4a4:9e2a",
+        "77.249.170.48",
+        "77.249.170.51",
+    ]
+    assert data["cidrs"] == ["d5af:46c8::/32", "77.249.170.0/24"]
+
+
+def test_anonymize_cidr_host_bits_return_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": KEY, "cidrs": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "cidrs" for err in response.json()["detail"])
+
+
+def test_anonymize_bare_address_in_cidrs_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": KEY, "cidrs": ["10.0.0.1"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "cidrs" for err in response.json()["detail"])
+
+
+def test_anonymize_invalid_address_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": KEY, "addresses": ["bogus"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "addresses" for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_cidr_notation_in_addresses_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": KEY, "addresses": ["10.0.0.1/32"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "addresses" for err in response.json()["detail"]
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    ["", "00", "z" * 64, "g" + "0" * 63, "0" * 63, "0" * 65, None],
+)
+def test_anonymize_invalid_key_returns_422(bad_key):
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": bad_key, "addresses": ["10.0.0.1"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "key_hex" for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_missing_key_returns_422():
+    response = client.post("/anonymize", json={"addresses": []})
+    assert response.status_code == 422
+    assert any(
+        "key_hex" in err["loc"] for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_wrong_type_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": 123, "addresses": []},
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": KEY, "addresses": [10]},
+    )
+    assert response.status_code == 422
+
+
+def test_anonymize_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/anonymize" in spec["paths"]
+    operation = spec["paths"]["/anonymize"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "prefix_preserving_v4_and_v6" in examples
+    assert "host_bits_set" in examples
+    schema = spec["components"]["schemas"]["AnonymizeResponse"]
+    assert set(schema["properties"]) == {"addresses", "cidrs"}

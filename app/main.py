@@ -1,5 +1,5 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules, /minimize-policy and /allocate."""
+/audit-rules, /minimize-policy, /allocate and /anonymize."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 
 from app.policy import (
     allocate,
+    anonymize,
     audit_rules,
     compare,
     evaluate,
@@ -17,6 +18,8 @@ from app.schemas import (
     AddressDecision,
     AllocateRequest,
     AllocateResponse,
+    AnonymizeRequest,
+    AnonymizeResponse,
     AuditRulesRequest,
     AuditRulesResponse,
     CompareRequest,
@@ -37,11 +40,12 @@ app = FastAPI(
         "match; diff two policy sets (baseline vs candidate) over a "
         "scope CIDR; audit each allow/deny rule for its real impact inside "
         "one scope; minimize an allow/deny list to the smallest subset "
-        "equivalent inside one scope; and allocate non-overlapping subnets "
+        "equivalent inside one scope; allocate non-overlapping subnets "
         "for a list of requests inside one scope, avoiding already-occupied "
-        "CIDRs."
+        "CIDRs; and prefix-preservingly anonymize bare IPv4/IPv6 addresses "
+        "and strict CIDRs with an HMAC-SHA256 key for safe list sharing."
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -508,3 +512,92 @@ def allocate_subnets(request: AllocateRequest) -> dict:
             ),
         )
     return result
+
+
+@app.post(
+    "/anonymize",
+    response_model=AnonymizeResponse,
+    tags=["policy"],
+    summary="Prefix-preserving keyed anonymization of addresses and CIDRs",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "prefix_preserving_v4_and_v6": {
+                            "summary": (
+                                "Stable one-to-one mapping; the /24 keeps its "
+                                "anonymized network address prefix and length"
+                            ),
+                            "value": {
+                                "key_hex": (
+                                    "0123456789abcdef"
+                                    "0123456789abcdef"
+                                    "0123456789abcdef"
+                                    "0123456789abcdef"
+                                ),
+                                "addresses": [
+                                    "10.0.0.1", "10.0.0.2",
+                                    "192.0.2.1", "2001:db8::1",
+                                ],
+                                "cidrs": ["10.0.0.0/24", "2001:db8::/32"],
+                            },
+                        },
+                        "host_bits_set": {
+                            "summary": "Non-zero host bits in a CIDR -> HTTP 422",
+                            "value": {
+                                "key_hex": "0" * 64,
+                                "addresses": [],
+                                "cidrs": ["10.0.0.1/24"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "One anonymized entry per input address and per input CIDR, "
+                "each list in input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "prefix_preserving_v4_and_v6": {
+                            "summary": (
+                                "Stable one-to-one outputs; the two /24-mates "
+                                "keep their /30 longest common prefix and stay "
+                                "inside the anonymized 77.249.170.0/24"
+                            ),
+                            "value": {
+                                "addresses": [
+                                    "77.249.170.48",
+                                    "77.249.170.51",
+                                    "236.60.54.68",
+                                    "d5af:46c8:beb3:e56d:c681:ca26:c4a4:9e2a",
+                                ],
+                                "cidrs": [
+                                    "77.249.170.0/24",
+                                    "d5af:46c8::/32",
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "key_hex is not 64 hexadecimal characters, an address is "
+                "invalid, or a CIDR is invalid, lacks a prefix length, or "
+                "has non-zero host bits."
+            ),
+        },
+    },
+)
+def anonymize_addresses(request: AnonymizeRequest) -> dict:
+    return anonymize(request.key_hex, request.addresses, request.cidrs)

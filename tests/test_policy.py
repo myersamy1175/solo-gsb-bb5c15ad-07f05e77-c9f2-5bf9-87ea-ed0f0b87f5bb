@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
 import random
 
 import pytest
 
 from app.policy import (
+    _anonymize_address,
     _normalize_family,
     allocate,
+    anonymize,
     audit_rules,
     compare,
     evaluate,
     minimize_policy,
     normalize,
     parse_address,
+    parse_key_hex,
     parse_network,
+    parse_strict_cidr,
     TRANSITION_KEYS,
 )
 
@@ -1428,3 +1434,199 @@ def test_allocate_matches_brute_force_ipv6(seed):
         for i in range(rng.randint(0, 3))
     ]
     _assert_allocate_matches_brute_force(scope, occupied, requests)
+
+
+# ---------------------------------------------------------------------------
+# anonymize: prefix-preserving keyed HMAC anonymization.
+# ---------------------------------------------------------------------------
+
+
+def _ref_anonymize_address(address, key):
+    """Independent bit-by-bit reference using the documented HMAC message."""
+    family = type(address)
+    width = 32 if family is ipaddress.IPv4Address else 128
+    tag = 4 if family is ipaddress.IPv4Address else 6
+    bits = "".join(f"{byte:08b}" for byte in address.packed)
+    out = []
+    for position, bit in enumerate(bits):
+        prefix_bits = bits[:position].ljust(width, "0")
+        message = (
+            bytes([tag, position])
+            + int(prefix_bits, 2).to_bytes(width // 8, "big")
+        )
+        mask = hmac.new(key, message, hashlib.sha256).digest()[0] >> 7
+        out.append(str(int(bit) ^ mask))
+    return family(int("".join(out), 2))
+
+
+def test_anonymize_matches_independent_reference():
+    for key in (bytes(32), bytes(range(32))):
+        for text in (
+            "0.0.0.0", "10.0.0.1", "127.0.0.1", "255.255.255.255",
+            "::", "::1", "2001:db8::1",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ):
+            address = ipaddress.ip_address(text)
+            assert _anonymize_address(address, key) == _ref_anonymize_address(
+                address, key
+            )
+
+
+def test_anonymize_is_stable_for_one_key():
+    key = "11" * 32
+    first = anonymize(key, ["10.0.0.1", "2001:db8::1"], ["10.0.0.0/24"])
+    second = anonymize(key, ["10.0.0.1", "2001:db8::1"], ["10.0.0.0/24"])
+    assert first == second
+
+
+def test_anonymize_is_deterministic_bitwise():
+    key = bytes.fromhex("ab" * 32)
+    address = ipaddress.ip_address("198.51.100.7")
+    assert _anonymize_address(address, key) == _anonymize_address(address, key)
+
+
+def test_anonymize_mapping_is_one_to_one_over_ipv4_block():
+    # Exhaustive over a /24: 256 distinct inputs map to 256 distinct outputs.
+    key = bytes(range(32))
+    base = int(ipaddress.IPv4Address("198.51.100.0"))
+    outputs = {
+        int(_anonymize_address(ipaddress.IPv4Address(base + i), key))
+        for i in range(256)
+    }
+    assert len(outputs) == 256
+
+
+def test_anonymize_mapping_is_one_to_one_over_ipv6_block():
+    # Exhaustive over a /120 (keeps enumeration cheap while covering IPv6).
+    key = bytes(range(32))
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+    outputs = {
+        int(_anonymize_address(ipaddress.IPv6Address(base + i), key))
+        for i in range(256)
+    }
+    assert len(outputs) == 256
+
+
+def _lcp_length(left, right, width):
+    differing = int(left) ^ int(right)
+    return width - differing.bit_length() if differing else width
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_anonymize_preserves_longest_common_prefix(seed):
+    rng = random.Random(6000 + seed)
+    for _ in range(50):
+        width = rng.choice((32, 128))
+        family = (
+            ipaddress.IPv4Address if width == 32 else ipaddress.IPv6Address
+        )
+        left = family(rng.getrandbits(width))
+        right = family(rng.getrandbits(width))
+        key = rng.randbytes(32)
+        anon_left = _anonymize_address(left, key)
+        anon_right = _anonymize_address(right, key)
+        assert _lcp_length(left, right, width) == _lcp_length(
+            anon_left, anon_right, width
+        )
+
+
+def test_anonymize_address_families_use_domain_separation():
+    # The IPv4-mapped IPv6 address of an IPv4 input must NOT share the IPv4
+    # anonymization pattern, because family tags separate the HMAC messages.
+    key = bytes(range(32))
+    v4 = ipaddress.ip_address("192.0.2.123")
+    mapped = ipaddress.ip_address("::ffff:192.0.2.123")
+    assert int(_anonymize_address(v4, key)) != int(
+        _anonymize_address(mapped, key)
+    ) & ((1 << 32) - 1)
+
+
+def test_anonymize_outputs_follow_input_order():
+    key = "00" * 32
+    result = anonymize(
+        key,
+        ["10.0.0.2", "10.0.0.1", "192.0.2.1", "2001:db8::1"],
+        ["2001:db8::/32", "10.0.0.0/24"],
+    )
+    expected_addresses = [
+        str(_anonymize_address(parse_address(item), bytes(32)))
+        for item in ["10.0.0.2", "10.0.0.1", "192.0.2.1", "2001:db8::1"]
+    ]
+    assert result["addresses"] == expected_addresses
+    assert len(result["cidrs"]) == 2
+
+
+def test_anonymize_cidr_re_masks_anonymized_network_address():
+    # Anonymization of the /24 network address may produce host bits; the
+    # returned CIDR must be canonical and keep the original prefix length.
+    key = "0123456789abcdef" * 4
+    result = anonymize(key, [], ["10.0.0.0/24", "2001:db8::/32"])
+    for text in result["cidrs"]:
+        # parse_network is strict: this rejects any non-zero host bits.
+        network = parse_network(text)
+        assert str(network) == text
+    assert result["cidrs"][0].endswith("/24")
+    assert result["cidrs"][1].endswith("/32")
+
+
+def test_anonymize_network_address_lies_in_anonymized_cidr():
+    # Prefix preservation means the anonymized network address is inside the
+    # anonymized network for every network in the block (checked exhaustively
+    # for one /29).
+    key = bytes(range(32))
+    for host in range(8):
+        text = f"192.0.2.{host}"
+        result = anonymize(key.hex(), [], ["192.0.2.0/29"])
+        anon_address = parse_address(
+            anonymize(key.hex(), [text], [])["addresses"][0]
+        )
+        anon_network = parse_network(result["cidrs"][0])
+        assert anon_address in anon_network
+
+
+def test_anonymize_empty_lists():
+    assert anonymize("00" * 32, [], []) == {"addresses": [], "cidrs": []}
+
+
+def test_parse_key_hex_accepts_64_hex_characters():
+    assert parse_key_hex("00" * 32) == bytes(32)
+    assert parse_key_hex("  AbCdEf" + "00" * 29 + "  ") == bytes.fromhex(
+        "abcdef" + "00" * 29
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "00" * 31,              # too short (62 chars)
+        "00" * 33,              # too long
+        "z" * 64,               # non-hex characters
+        "00 " + "00" * 31,      # whitespace inside
+        "",
+        123,
+        None,
+    ],
+)
+def test_parse_key_hex_rejects_invalid_keys(bad):
+    with pytest.raises(ValueError):
+        parse_key_hex(bad)
+
+
+def test_parse_strict_cidr_requires_explicit_prefix():
+    with pytest.raises(ValueError):
+        parse_strict_cidr("10.0.0.1")
+    with pytest.raises(ValueError):
+        parse_strict_cidr("2001:db8::1")
+    with pytest.raises(ValueError):
+        parse_strict_cidr(10)
+    assert str(parse_strict_cidr("10.0.0.0/24")) == "10.0.0.0/24"
+
+
+def test_parse_strict_cidr_rejects_host_bits():
+    with pytest.raises(ValueError):
+        parse_strict_cidr("10.0.0.1/24")
+
+
+def test_anonymize_rejects_bare_address_in_cidrs():
+    with pytest.raises(ValueError):
+        anonymize("00" * 32, [], ["10.0.0.1"])

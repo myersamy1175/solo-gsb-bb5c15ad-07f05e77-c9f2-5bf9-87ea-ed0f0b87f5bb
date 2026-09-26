@@ -10,7 +10,9 @@ from app.policy import (
     MINIMIZE_POLICY_RULE_LIMIT,
     _MAX_PREFIXLEN,
     parse_address,
+    parse_key_hex,
     parse_network,
+    parse_strict_cidr,
 )
 
 
@@ -438,5 +440,61 @@ class AllocateResponse(BaseModel):
         description=(
             "Total free addresses left in the scope, as a decimal string "
             "(IPv6 remainders exceed JSON's safe integer range)."
+        ),
+    )
+
+
+class AnonymizeRequest(BaseModel):
+    key_hex: str = Field(
+        description=(
+            "256-bit anonymization key as exactly 64 hexadecimal characters. "
+            "The mapping is stable for a fixed key."
+        ),
+    )
+    addresses: list[str] = Field(
+        default_factory=list,
+        description="Bare IPv4/IPv6 addresses to anonymize, in response order.",
+    )
+    cidrs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Strict CIDRs (explicit prefix length, zero host bits) to "
+            "anonymize, in response order."
+        ),
+    )
+
+    @field_validator("key_hex")
+    @classmethod
+    def _validate_key_hex(cls, value: str) -> str:
+        # A ValueError raised here is turned by FastAPI into an HTTP 422
+        # response carrying the offending field and value.
+        parse_key_hex(value)
+        return value
+
+    @field_validator("addresses")
+    @classmethod
+    def _validate_address_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_address(value)
+        return values
+
+    @field_validator("cidrs")
+    @classmethod
+    def _validate_cidr_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_strict_cidr(value)
+        return values
+
+
+class AnonymizeResponse(BaseModel):
+    addresses: list[str] = Field(
+        description=(
+            "Anonymized bare addresses, one per input address, in input order."
+        ),
+    )
+    cidrs: list[str] = Field(
+        description=(
+            "Anonymized canonical network segments, one per input CIDR, in "
+            "input order, each keeping the original prefix length."
         ),
     )
