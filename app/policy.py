@@ -1,0 +1,1095 @@
+"""CIDR allow/deny normalization built on the standard-library ``ipaddress``.
+
+The core operation is a set difference ``allow - deny`` computed independently
+for IPv4 and IPv6.  When a deny prefix cuts through an allow prefix the allow
+network is recursively split into its two halves until every deny boundary is
+aligned with a prefix.  Pieces are merged back only when they form two
+complete, adjacent sibling prefixes (via :func:`ipaddress.collapse_addresses`),
+which yields the equivalent, non-overlapping and minimum-cardinality CIDR set.
+
+The module also hosts three scope-based consumers of the same primitives:
+``compare`` (decision diff of two policy sets inside one scope),
+``audit_rules`` (per-entry impact classification inside one scope) and
+``minimize_policy`` (minimum-cardinality equivalent rule subset inside one
+scope), plus ``allocate`` (lexicographically smallest non-overlapping subnet
+assignment inside one scope, avoiding occupied CIDRs).
+"""
+
+from __future__ import annotations
+
+import ipaddress
+from collections.abc import Iterable, Sequence
+from typing import TypeAlias, Union
+
+Network: TypeAlias = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+Address: TypeAlias = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+#: Maximum total number of allow/deny rules accepted by ``/minimize-policy``.
+MINIMIZE_POLICY_RULE_LIMIT = 16
+
+# Side rank used as the second component of the match-comparison key: at equal
+# prefix length a deny entry must beat an allow entry.
+_SIDE_RANK: dict[str, int] = {"allow": 0, "deny": 1}
+
+_MAX_PREFIXLEN: dict[type, int] = {
+    ipaddress.IPv4Network: 32,
+    ipaddress.IPv6Network: 128,
+}
+
+
+def parse_network(value: object) -> Network:
+    """Parse a strict CIDR string into an IPv4/IPv6 network object.
+
+    ``strict=True`` rejects addresses with host bits set (e.g. ``10.0.0.1/24``).
+    A bare address (``10.0.0.1``) is accepted as a host prefix (``/32`` or
+    ``/128``).  Any invalid input raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"CIDR must be a string, got {type(value).__name__}")
+    return ipaddress.ip_network(value.strip(), strict=True)
+
+
+def parse_address(value: object) -> Address:
+    """Parse a bare IPv4/IPv6 address (CIDR notation is rejected).
+
+    Unlike :func:`parse_network`, neither ``10.0.0.1/24`` nor a host prefix
+    such as ``10.0.0.1/32`` is accepted here — evaluation targets are plain
+    addresses only.  Any invalid input raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"address must be a string, got {type(value).__name__}")
+    text = value.strip()
+    if "/" in text:
+        raise ValueError(f"{value!r} is an address with a prefix length")
+    return ipaddress.ip_address(text)
+
+
+def _sort_key(network: Network) -> tuple[bytes, int]:
+    # ``packed`` orders network addresses as unsigned byte strings (works for
+    # both families); prefix length is the secondary, stable key.
+    return network.network_address.packed, network.prefixlen
+
+
+def _diff(network: Network, deny: Sequence[Network]) -> list[Network]:
+    """Subtract every deny network from one allow network by recursive splits.
+
+    Caller guarantees that ``deny`` contains only strict subnets of
+    ``network`` (equal/net-supernet cases are handled before calling this).
+    Each recursion splits ``network`` into its two immediate sibling halves;
+    a half that contains no deny prefix survives whole, while a half that does
+    is split again — this is exactly the "cut through, split recursively"
+    rule, and it produces maximal (minimum-count) aligned prefixes.
+    """
+    if not deny:
+        return [network]
+
+    # Defensive guard: a /32 or /128 has no strict subnets, so with a
+    # correctly filtered ``deny`` this branch is unreachable.
+    if network.prefixlen == _MAX_PREFIXLEN[type(network)]:
+        return [network]
+
+    left, right = network.subnets()
+
+    result: list[Network] = []
+    for half in (left, right):
+        half_deny = [d for d in deny if d.subnet_of(half)]
+        if any(d == half for d in half_deny):
+            # The whole half is denied: it contributes nothing.
+            continue
+        if not half_deny:
+            # No deny boundary touches the half: keep it whole.
+            result.append(half)
+        else:
+            # Deny prefixes cut through the half: split again.
+            result.extend(_diff(half, half_deny))
+    return result
+
+
+def _normalize_family(
+    allow: Iterable[Network],
+    deny: Iterable[Network],
+    family: type,
+) -> list[Network]:
+    """Compute allow - deny for one address family, minimum and non-overlapping."""
+    # Collapsing first removes duplicates/overlap and contained prefixes in
+    # each input list, which also bounds the recursion work below.
+    allow_nets = list(ipaddress.collapse_addresses(
+        n for n in allow if isinstance(n, family)
+    ))
+    deny_nets = list(ipaddress.collapse_addresses(
+        n for n in deny if isinstance(n, family)
+    ))
+
+    survivors: list[Network] = []
+    for network in allow_nets:
+        strict_deny: list[Network] = []
+        swallowed = False
+        for blocked in deny_nets:
+            if network == blocked or network.subnet_of(blocked):
+                # A deny prefix equal to or larger than the allow network
+                # removes it completely.
+                swallowed = True
+                break
+            if blocked.subnet_of(network):
+                # A deny prefix cutting through the network: recurse.
+                strict_deny.append(blocked)
+        if swallowed:
+            continue
+        if not strict_deny:
+            survivors.append(network)
+        else:
+            survivors.extend(_diff(network, strict_deny))
+
+    # Sibling-only merge.  collapse_addresses merges a pair only when both are
+    # complete adjacent halves of one common parent; merely adjacent prefixes
+    # of unequal length are left untouched.
+    merged = list(ipaddress.collapse_addresses(survivors))
+    merged.sort(key=_sort_key)
+    return merged
+
+
+def _list_stats(raw: Sequence[str], networks: Sequence[Network]) -> dict:
+    unique = set(networks)
+    return {
+        "input": len(raw),
+        "unique": len(unique),
+        "duplicates_removed": len(raw) - len(unique),
+        "ipv4": sum(isinstance(n, ipaddress.IPv4Network) for n in unique),
+        "ipv6": sum(isinstance(n, ipaddress.IPv6Network) for n in unique),
+    }
+
+
+def normalize(allow_raw: Sequence[str], deny_raw: Sequence[str]) -> dict:
+    """Parse, validate and normalize allow/deny CIDR lists.
+
+    Input strings are assumed to have been validated already (e.g. by the
+    Pydantic schema); a malformed value raises :class:`ValueError`.
+    """
+    allow_nets = [parse_network(item) for item in allow_raw]
+    deny_nets = [parse_network(item) for item in deny_raw]
+
+    ipv4_result = _normalize_family(
+        allow_nets, deny_nets, ipaddress.IPv4Network
+    )
+    ipv6_result = _normalize_family(
+        allow_nets, deny_nets, ipaddress.IPv6Network
+    )
+
+    return {
+        "ipv4": [str(network) for network in ipv4_result],
+        "ipv6": [str(network) for network in ipv6_result],
+        "stats": {
+            "allow": _list_stats(allow_raw, allow_nets),
+            "deny": _list_stats(deny_raw, deny_nets),
+            "output": {
+                "ipv4": len(ipv4_result),
+                "ipv6": len(ipv6_result),
+                "total": len(ipv4_result) + len(ipv6_result),
+            },
+        },
+    }
+
+
+def _best_match(
+    address: Address,
+    entries: Sequence[tuple[int, Network, str]],
+) -> dict | None:
+    """Return the winning list entry for one address, or ``None`` if none match.
+
+    ``entries`` holds ``(original_index, network, side)`` triples restricted to
+    the address family.  The comparison key orders by:
+
+    1. prefix length — longest-prefix wins;
+    2. side rank — at equal length ``deny`` beats ``allow``;
+    3. original list index (negated) — the earlier entry in its side list
+       wins, which makes the final decision stable.
+    """
+    best: tuple[int, int, int] | None = None
+    best_network: Network | None = None
+    best_side: str | None = None
+    for index, network, side in entries:
+        if address in network:
+            key = (network.prefixlen, _SIDE_RANK[side], -index)
+            if best is None or key > best:
+                best = key
+                best_network = network
+                best_side = side
+    if best is None:
+        return None
+    return {
+        "decision": best_side,
+        "matched_cidr": str(best_network),
+        "matched_side": best_side,
+    }
+
+
+def evaluate(
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+    address_raw: Sequence[str],
+) -> list[dict]:
+    """Evaluate each address against allow/deny lists by longest-prefix match.
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema); a
+    malformed value raises :class:`ValueError`.  Results are returned in the
+    same order as ``address_raw``.
+    """
+    allow_entries: list[tuple[int, Network, str]] = [
+        (i, parse_network(item), "allow") for i, item in enumerate(allow_raw)
+    ]
+    deny_entries: list[tuple[int, Network, str]] = [
+        (i, parse_network(item), "deny") for i, item in enumerate(deny_raw)
+    ]
+    entries = allow_entries + deny_entries
+
+    results: list[dict] = []
+    for item in address_raw:
+        address = parse_address(item)
+        family_entries = [
+            (index, network, side)
+            for index, network, side in entries
+            if network.version == address.version
+        ]
+        match = _best_match(address, family_entries)
+        if match is None:
+            results.append(
+                {"decision": "unmatched", "matched_cidr": None,
+                 "matched_side": None}
+            )
+        else:
+            results.append(match)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# compare: decision-constant CIDR partitioning of one scope for two policy
+# sets (baseline vs candidate), reusing the evaluate precedence rules.
+# ---------------------------------------------------------------------------
+
+#: Possible per-address decisions, including "nothing matches".
+DECISIONS: tuple[str, ...] = ("allow", "deny", "unmatched")
+
+#: Every baseline -> candidate transition, in a fixed display order.
+TRANSITION_KEYS: tuple[str, ...] = tuple(
+    f"{left}->{right}"
+    for left in DECISIONS
+    for right in DECISIONS
+    if left != right
+)
+
+
+def _parse_entries(
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+    family: type,
+) -> list[tuple[int, Network, str]]:
+    """Build ``(index, network, side)`` entries for one address family."""
+    entries: list[tuple[int, Network, str]] = []
+    for index, item in enumerate(allow_raw):
+        network = parse_network(item)
+        if isinstance(network, family):
+            entries.append((index, network, "allow"))
+    for index, item in enumerate(deny_raw):
+        network = parse_network(item)
+        if isinstance(network, family):
+            entries.append((index, network, "deny"))
+    return entries
+
+
+def _entry_key(entry: tuple[int, Network, str]) -> tuple[int, int, int]:
+    """Match-comparison key shared with :func:`_best_match`."""
+    index, network, side = entry
+    return network.prefixlen, _SIDE_RANK[side], -index
+
+
+def _pick_winner(
+    entries: Sequence[tuple[int, Network, str]],
+) -> tuple[int, Network, str] | None:
+    """Best entry by longest-prefix/deny/index priority, or ``None``."""
+    return max(entries, key=_entry_key, default=None)
+
+
+def _winner_side(winner: tuple[int, Network, str] | None) -> str:
+    return winner[2] if winner is not None else "unmatched"
+
+
+def _partition_node(
+    network: Network,
+    inherited: tuple[int, Network, str] | None,
+    entries: Sequence[tuple[int, Network, str]],
+    out: list[tuple[Network, tuple[int, Network, str] | None]],
+) -> None:
+    """Recursively append winner-constant pieces covering ``network``.
+
+    Each emitted piece is paired with the exact entry that wins everywhere in
+    it (``None`` when the piece is unmatched).  ``inherited`` is the winning
+    entry of a strictly broader prefix (already decided at an ancestor);
+    ``entries`` are all entries that are subnets of ``network`` (equal or
+    stricter).  A node only needs splitting while it contains an entry
+    strictly deeper than itself, mirroring :func:`_diff`: untouched halves
+    survive whole, which keeps every piece maximal.
+    """
+    own = [entry for entry in entries if entry[1] == network]
+    strict = [entry for entry in entries if entry[1] != network]
+    # An equal-length entry always beats the inherited strictly-broader
+    # winner (longest-prefix rule); deny still wins equal-length own ties.
+    winner = _pick_winner(own)
+    if winner is None:
+        winner = inherited
+
+    if not strict or network.prefixlen == _MAX_PREFIXLEN[type(network)]:
+        out.append((network, winner))
+        return
+
+    left, right = network.subnets()
+    for half in (left, right):
+        half_entries = [entry for entry in strict if entry[1].subnet_of(half)]
+        _partition_node(half, winner, half_entries, out)
+
+
+def _winner_partition(
+    scope: Network,
+    entries: Sequence[tuple[int, Network, str]],
+) -> list[tuple[Network, tuple[int, Network, str] | None]]:
+    """Partition ``scope`` into maximal CIDRs, each paired with its winner.
+
+    Entries equal to or broader than ``scope`` decide the root (longest
+    prefix, deny winning equal-length ties); strict subnets force recursive
+    splits.  The returned pieces are non-overlapping and jointly exhaust
+    ``scope``; a paired winner of ``None`` means the piece is unmatched.
+    """
+    covering = [
+        entry for entry in entries
+        if entry[1] == scope or scope.subnet_of(entry[1])
+    ]
+    root_winner = _pick_winner(covering)
+    strict = [
+        entry for entry in entries
+        if entry[1] != scope and entry[1].subnet_of(scope)
+    ]
+
+    pieces: list[tuple[Network, tuple[int, Network, str] | None]] = []
+    if not strict:
+        pieces.append((scope, root_winner))
+        return pieces
+
+    left, right = scope.subnets()
+    for half in (left, right):
+        half_entries = [entry for entry in strict if entry[1].subnet_of(half)]
+        _partition_node(half, root_winner, half_entries, pieces)
+    return pieces
+
+
+def _decision_partition(
+    scope: Network,
+    entries: Sequence[tuple[int, Network, str]],
+) -> list[tuple[Network, str]]:
+    """Partition ``scope`` into maximal CIDRs each having one constant decision.
+
+    Thin decision-side projection of :func:`_winner_partition` (the
+    ``/compare`` path only needs the winning side, not the entry itself).
+    """
+    return [
+        (network, _winner_side(winner))
+        for network, winner in _winner_partition(scope, entries)
+    ]
+
+
+def _overlay_partitions(
+    baseline: Sequence[tuple[Network, str]],
+    candidate: Sequence[tuple[Network, str]],
+) -> list[tuple[Network, str, str]]:
+    """Intersect two tilings of the same scope into (cidr, base, candidate).
+
+    Every baseline piece and candidate piece is prefix-aligned, so when two
+    pieces overlap one equals or contains the other; the finer network of the
+    pair is the intersection.  The result again tiles the whole scope.
+    """
+    refined: list[tuple[Network, str, str]] = []
+    for base_network, base_decision in baseline:
+        for cand_network, cand_decision in candidate:
+            if not base_network.overlaps(cand_network):
+                continue
+            if cand_network == base_network or cand_network.subnet_of(base_network):
+                refined.append((cand_network, base_decision, cand_decision))
+            else:
+                # The baseline piece is the finer (strict subnet) one.
+                refined.append((base_network, base_decision, cand_decision))
+    return refined
+
+
+def _merge_labelled(
+    blocks: Sequence[tuple[Network, str, str]],
+) -> list[tuple[Network, str, str]]:
+    """Recursively merge complete sibling pairs with identical transition.
+
+    A pair merges only when both halves of one common parent are present and
+    both carry the same ``(baseline, candidate)`` label.  The fixpoint loop
+    repeats so parents formed by a merge can merge again, just like
+    :func:`ipaddress.collapse_addresses` — but adjacent unequal-length
+    prefixes, and siblings whose transitions differ, are never joined.
+    """
+    pieces = list(blocks)
+    while True:
+        groups: dict[tuple[bytes, int], list[tuple[Network, str, str]]] = {}
+        for block in pieces:
+            network = block[0]
+            if network.prefixlen == 0:
+                continue
+            parent = network.supernet()
+            groups.setdefault(_sort_key(parent), []).append(block)
+
+        merged: list[tuple[Network, str, str]] = []
+        consumed: set[int] = set()
+        for group in groups.values():
+            labels = {block[1:] for block in group}
+            if len(group) == 2 and len(labels) == 1:
+                parent = group[0][0].supernet()
+                merged.append((parent, group[0][1], group[0][2]))
+                consumed.update(id(block) for block in group)
+
+        if not merged:
+            return pieces
+        pieces = merged + [
+            block for block in pieces if id(block) not in consumed
+        ]
+
+
+def compare(
+    scope_raw: str,
+    baseline_allow: Sequence[str],
+    baseline_deny: Sequence[str],
+    candidate_allow: Sequence[str],
+    candidate_deny: Sequence[str],
+) -> dict:
+    """Compare baseline vs candidate decisions everywhere inside ``scope``.
+
+    Both policy sets are independently partitioned into decision-constant
+    CIDRs; the two tilings are overlaid (intersected) and only regions whose
+    decision differs survive, after sibling merging by transition type.
+    Inputs are assumed validated already (e.g. by the Pydantic schema); a
+    malformed value raises :class:`ValueError`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    baseline_entries = _parse_entries(baseline_allow, baseline_deny, family)
+    candidate_entries = _parse_entries(candidate_allow, candidate_deny, family)
+
+    baseline_parts = _decision_partition(scope, baseline_entries)
+    candidate_parts = _decision_partition(scope, candidate_entries)
+    refined = _overlay_partitions(baseline_parts, candidate_parts)
+
+    differences = [
+        (network, base_decision, cand_decision)
+        for network, base_decision, cand_decision in refined
+        if base_decision != cand_decision
+    ]
+    differences = _merge_labelled(differences)
+    differences.sort(key=lambda block: _sort_key(block[0]))
+
+    counts = {key: 0 for key in TRANSITION_KEYS}
+    for network, base_decision, cand_decision in differences:
+        counts[f"{base_decision}->{cand_decision}"] += network.num_addresses
+
+    return {
+        "differences": [
+            {
+                "cidr": str(network),
+                "baseline_decision": base_decision,
+                "candidate_decision": cand_decision,
+            }
+            for network, base_decision, cand_decision in differences
+        ],
+        "transition_counts": {
+            key: str(counts[key]) for key in TRANSITION_KEYS
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# audit-rules: per-entry impact classification inside one scope.  Every allow/
+# deny entry is effective (wins somewhere in scope, with the numerically
+# smallest witness IP), shadowed (covered inside scope by entries that always
+# beat it; shadowed_by lists their side+index) or out_of_scope (no overlap).
+# Analysis reuses the CIDR winner partition above and never enumerates
+# addresses.
+# ---------------------------------------------------------------------------
+
+
+def audit_rules(
+    scope_raw: str,
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+) -> dict:
+    """Classify every input rule by its real impact on decisions in ``scope``.
+
+    The scope is partitioned into winner-constant maximal CIDRs by
+    :func:`_winner_partition`.  A rule's region is its CIDR clipped to the
+    scope; it is ``effective`` when it wins one or more partition pieces
+    (the witness is the smallest network address among those pieces),
+    ``shadowed`` when the region is non-empty but another entry wins every
+    piece of it, or ``out_of_scope`` when its CIDR does not intersect the
+    scope at all.  ``shadowed_by`` holds the distinct ``(side, index)``
+    references of the entries actually winning those pieces — only entries
+    that can win themselves can shadow.
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema): the
+    scope and every rule CIDR parse strictly and all share one address
+    family.  A malformed value raises :class:`ValueError`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    allow_nets = [parse_network(item) for item in allow_raw]
+    deny_nets = [parse_network(item) for item in deny_raw]
+    entries: list[tuple[int, Network, str]] = [
+        (index, network, "allow")
+        for index, network in enumerate(allow_nets)
+        if isinstance(network, family)
+    ]
+    entries.extend(
+        (index, network, "deny")
+        for index, network in enumerate(deny_nets)
+        if isinstance(network, family)
+    )
+
+    partition = _winner_partition(scope, entries)
+
+    def classify(
+        side: str, index: int, network: Network
+    ) -> dict:
+        if not network.overlaps(scope):
+            # CIDRs are laminar: a same-family network is either disjoint or
+            # nested, so a disjoint entry never affects scope at all.
+            return {"status": "out_of_scope"}
+
+        # Pieces tile the whole scope; because CIDRs never partially overlap,
+        # a piece intersects the entry exactly when one equals or contains
+        # the other (the entry may be broader than the whole scope).
+        own_pieces = [
+            (piece, winner)
+            for piece, winner in partition
+            if piece == network or piece.subnet_of(network)
+            or network.subnet_of(piece)
+        ]
+
+        won = [
+            piece
+            for piece, winner in own_pieces
+            if winner is not None
+            and winner[1] == network and winner[2] == side
+            and winner[0] == index
+        ]
+        if won:
+            # Smallest network address of the pieces the rule wins is the
+            # numerically smallest address in its winning region and is
+            # always inside that region.
+            witness = min(won, key=_sort_key).network_address
+            return {"status": "effective", "witness": str(witness)}
+
+        # The rule never wins inside scope: collect the distinct entries that
+        # win pieces of its region (unmatched pieces contribute no shadower).
+        shadowed_by = sorted(
+            {
+                (winner[2], winner[0])
+                for _, winner in own_pieces
+                if winner is not None
+            },
+        )
+        return {
+            "status": "shadowed",
+            "shadowed_by": [
+                {"side": rule_side, "index": rule_index}
+                for rule_side, rule_index in shadowed_by
+            ],
+        }
+
+    allow_results: list[dict] = []
+    for index, network in enumerate(allow_nets):
+        allow_results.append({
+            "side": "allow",
+            "index": index,
+            "cidr": str(network),
+            **classify("allow", index, network),
+        })
+
+    deny_results: list[dict] = []
+    for index, network in enumerate(deny_nets):
+        deny_results.append({
+            "side": "deny",
+            "index": index,
+            "cidr": str(network),
+            **classify("deny", index, network),
+        })
+
+    return {"allow": allow_results, "deny": deny_results}
+
+
+# ---------------------------------------------------------------------------
+# minimize-policy: smallest subset of the input rules whose decisions are
+# identical to the original policy everywhere inside one scope.  The scope is
+# partitioned into winner-constant CIDRs (no address enumeration); the subset
+# search is an exact branch-and-bound over rules (forced inclusions/exclusions,
+# most-constrained piece first), not one-by-one greedy deletion.  Ties between
+# minimum solutions are broken by the (side, index) sequence, lexicographically.
+# ---------------------------------------------------------------------------
+
+# Canonical rule ordering shared with the lex tie-break and the response:
+# allow before deny, lower original index first.
+_CANONICAL_SIDE_RANK: dict[str, int] = {"allow": 0, "deny": 1}
+
+
+def _piece_intersects_rule(piece: Network, network: Network) -> bool:
+    """Whether a partition piece intersects a rule (aligned CIDRs are laminar)."""
+    return piece == network or piece.subnet_of(network) or network.subnet_of(piece)
+
+
+def _minimize_family(
+    scope: Network,
+    rules: Sequence[tuple[int, Network, str]],
+) -> list[tuple[int, Network, str]]:
+    """Return the minimum subset of ``rules`` preserving decisions in scope.
+
+    ``rules`` are ``(original_index, network, side)`` triples sharing
+    ``scope``'s family; triples come back in the same shape.  The original
+    policy partitions the scope into winner-constant pieces.  A piece whose
+    original winner is ``None`` needs nothing (any covering rule would win
+    it, so no retained rule can cover one in the first place); every other
+    piece carries its winner side as a requirement.  A retained candidate
+    secures such a piece once every covering opposite-side rule that outranks
+    it on the piece — its blockers — is excluded: same-side rules only
+    replace the winner by another rule of the same decision and never block.
+
+    The exact DFS branches on the most constrained non-secured piece,
+    retaining one viable candidate (forcing that candidate's blockers out) or
+    committing no new rule via the exclusion-only branch of a candidate that
+    is already retained.  The distinct set of original winners is the
+    initial feasible bound; the lexicographically smallest ``(side, index)``
+    sequence among equal-cardinality solutions wins.
+    """
+    # Canonical positions double as bit positions; order matches the lex key.
+    ordered = sorted(
+        rules,
+        key=lambda rule: (_CANONICAL_SIDE_RANK[rule[2]], rule[0]),
+    )
+    total = len(ordered)
+    full_mask = (1 << total) - 1
+
+    partition = _winner_partition(scope, ordered)
+
+    # Per labelled piece: (candidate bit, blocker mask) pairs.  Candidates are
+    # covering rules of the winner side; blockers are covering opposite-side
+    # rules with a strictly higher match key on that piece.
+    piece_options: list[list[tuple[int, int]]] = []
+    ever_candidate = 0
+    for piece, winner in partition:
+        if winner is None:
+            continue
+        options: list[tuple[int, int]] = []
+        for bit, (index, network, side) in enumerate(ordered):
+            if side != winner[2] or not _piece_intersects_rule(piece, network):
+                continue
+            blockers = 0
+            candidate_key = (network.prefixlen, _SIDE_RANK[side], -index)
+            for other_bit, (other_index, other_network, other_side) in enumerate(ordered):
+                if other_side == side or not _piece_intersects_rule(
+                    piece, other_network
+                ):
+                    continue
+                other_key = (
+                    other_network.prefixlen,
+                    _SIDE_RANK[other_side],
+                    -other_index,
+                )
+                if other_key > candidate_key:
+                    blockers |= 1 << other_bit
+            options.append((1 << bit, blockers))
+            ever_candidate |= 1 << bit
+        piece_options.append(options)
+
+    # A rule that is nowhere a candidate (disjoint, or out-gunned on every
+    # labelled piece it covers) can never belong to an equivalent subset.
+    initial_excluded = full_mask & ~ever_candidate
+
+    # Feasible upper bound: the distinct original winners.  Each original
+    # winner outranks every covering opposite-side rule of its own piece, so
+    # its blocker mask there is empty and the set secures all labelled pieces.
+    winner_keys = {
+        (winner[2], winner[0])
+        for _piece, winner in partition
+        if winner is not None
+    }
+    initial_best = 0
+    for bit, (index, _network, side) in enumerate(ordered):
+        if (side, index) in winner_keys:
+            initial_best |= 1 << bit
+    best_mask = initial_best & ~initial_excluded
+
+    def lex_key(mask: int) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (ordered[bit][2], ordered[bit][0])
+            for bit in range(total)
+            if mask & (1 << bit)
+        )
+
+    def solve() -> int:
+        best = best_mask
+        visited: set[tuple[int, int]] = set()
+        stack: list[tuple[int, int]] = [(0, initial_excluded)]
+        while stack:
+            retained, excluded = stack.pop()
+            retained &= ~excluded
+            state = (retained, excluded)
+            if state in visited:
+                continue
+            visited.add(state)
+
+            # Descendants only add retained rules; a state already larger than
+            # the incumbent cannot improve cardinality.  Same-size states stay
+            # eligible: an exclusion-only completion may beat its (side,index)
+            # sequence.
+            if retained.bit_count() > best.bit_count():
+                continue
+
+            selected: tuple | None = None
+            dead = False
+            for options in piece_options:
+                viable: list[tuple[int, int]] = []
+                for candidate, blockers in options:
+                    if candidate & excluded:
+                        continue
+                    # A retained blocker can never be excluded later.
+                    if blockers & retained:
+                        continue
+                    viable.append((candidate, blockers))
+                if not viable:
+                    dead = True
+                    break
+                if any(
+                    candidate & retained and not (blockers & ~excluded)
+                    for candidate, blockers in viable
+                ):
+                    continue  # this piece is already secured
+                new_options = [
+                    (candidate, blockers)
+                    for candidate, blockers in viable
+                    if not (candidate & retained)
+                ]
+                retained_options = [
+                    (candidate, blockers)
+                    for candidate, blockers in viable
+                    if candidate & retained
+                ]
+                # Most-constrained piece first: fewest fresh candidates, then
+                # prefer one already half-committed (exclusion-only branch).
+                rank = (len(new_options), 0 if retained_options else 1)
+                if selected is None or rank < selected[0]:
+                    selected = (rank, new_options, retained_options)
+
+            if dead:
+                continue
+            if selected is None:
+                # All labelled pieces secured; drop every undecided rule.
+                if (
+                    retained.bit_count() < best.bit_count()
+                    or (
+                        retained.bit_count() == best.bit_count()
+                        and lex_key(retained) < lex_key(best)
+                    )
+                ):
+                    best = retained
+                continue
+
+            _rank, new_options, retained_options = selected
+            # Push largest canonical bit first so the smallest is popped first:
+            # a small lex incumbent prunes the rest of the search harder.
+            for candidate, blockers in sorted(
+                new_options, key=lambda item: item[0], reverse=True
+            ):
+                new_retained = retained | candidate
+                new_excluded = excluded | blockers
+                if new_retained & new_excluded:
+                    continue
+                stack.append((new_retained, new_excluded))
+            for candidate, blockers in sorted(
+                retained_options, key=lambda item: item[0], reverse=True
+            ):
+                new_excluded = excluded | blockers
+                if retained & new_excluded:
+                    continue
+                stack.append((retained, new_excluded))
+        return best
+
+    best_mask = solve()
+    return [ordered[bit] for bit in range(total) if best_mask & (1 << bit)]
+
+
+def minimize_policy(
+    scope_raw: str,
+    allow_raw: Sequence[str],
+    deny_raw: Sequence[str],
+) -> dict:
+    """Find the smallest rule subset equivalent to the policy inside scope.
+
+    The scope is partitioned into winner-constant maximal CIDRs by
+    :func:`_winner_partition`; :func:`_minimize_family` runs the exact
+    minimum-subset search over those pieces — no address enumeration, no
+    one-by-one greedy deletion.  Ties resolve by the lexicographically
+    smallest retained ``(side, index)`` sequence (allow before deny, then
+    original list index).
+
+    The response lists retained and removed references in original input
+    order (all allow references first, then deny, each by index); every
+    retained rule carries the numerically smallest witness IP of a piece it
+    wins under the reduced policy.
+
+    Caller validation (e.g. the Pydantic schema) guarantees the scope and
+    every rule parse strictly, share one address family, and that the total
+    rule count is within :data:`MINIMIZE_POLICY_RULE_LIMIT`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    allow_nets = [parse_network(item) for item in allow_raw]
+    deny_nets = [parse_network(item) for item in deny_raw]
+    rules: list[tuple[int, Network, str]] = [
+        (index, network, "allow")
+        for index, network in enumerate(allow_nets)
+        if isinstance(network, family)
+    ]
+    rules.extend(
+        (index, network, "deny")
+        for index, network in enumerate(deny_nets)
+        if isinstance(network, family)
+    )
+
+    retained = _minimize_family(scope, rules)
+    retained_keys = {(side, index) for index, _network, side in retained}
+
+    # Witness per retained rule from the reduced policy's own partition: in a
+    # minimum subset every retained rule wins at least one piece.
+    witness: dict[tuple[str, int], Address] = {}
+    for piece, winner in _winner_partition(scope, retained):
+        if winner is None:
+            continue
+        key = (winner[2], winner[0])
+        address = piece.network_address
+        if key not in witness or int(address) < int(witness[key]):
+            witness[key] = address
+
+    retained_refs = [
+        {
+            "side": "allow", "index": index, "cidr": str(network),
+            "witness": str(witness[("allow", index)]),
+        }
+        for index, network in enumerate(allow_nets)
+        if ("allow", index) in retained_keys
+    ]
+    retained_refs.extend(
+        {
+            "side": "deny", "index": index, "cidr": str(network),
+            "witness": str(witness[("deny", index)]),
+        }
+        for index, network in enumerate(deny_nets)
+        if ("deny", index) in retained_keys
+    )
+    removed_refs = [
+        {"side": "allow", "index": index, "cidr": str(network)}
+        for index, network in enumerate(allow_nets)
+        if ("allow", index) not in retained_keys
+    ]
+    removed_refs.extend(
+        {"side": "deny", "index": index, "cidr": str(network)}
+        for index, network in enumerate(deny_nets)
+        if ("deny", index) not in retained_keys
+    )
+
+    return {"retained": retained_refs, "removed": removed_refs}
+
+
+def _subtract_free(free: Sequence[Network], block: Network) -> list[Network]:
+    """Remove ``block`` from the sorted, non-overlapping free list.
+
+    ``block`` is an aligned subnet of exactly one free piece; that piece is
+    replaced by its :meth:`ipaddress.IPv4Network.address_exclude`
+    decomposition, which keeps the list sorted, non-overlapping and minimal
+    (pieces of one exclusion are never mergeable siblings, and pieces of
+    different original blocks stay separated by non-free gaps).
+    """
+    out: list[Network] = []
+    for net in free:
+        if block.subnet_of(net):
+            out.extend(net.address_exclude(block))
+        else:
+            out.append(net)
+    out.sort(key=_sort_key)
+    return out
+
+
+def _aligned_candidates(
+    free: Sequence[Network],
+    prefixlen: int,
+    max_bits: int,
+) -> Iterable[Network]:
+    """Yield every aligned ``/prefixlen`` subnet of the free space, in order.
+
+    Iteration is lazy and follows the sorted free list, so candidates come
+    out in strictly increasing network-address order — exactly the order the
+    lexicographic search must try them in.
+    """
+    size = 1 << (max_bits - prefixlen)
+    for net in free:
+        if net.prefixlen > prefixlen:
+            # This free piece is itself smaller than the requested block.
+            continue
+        base = int(net.network_address)
+        for offset in range(0, net.num_addresses, size):
+            yield type(net)((base + offset, prefixlen))
+
+
+def _fits(free: Sequence[Network], prefixlens: Sequence[int]) -> bool:
+    """Necessary capacity condition for placing ``prefixlens`` in ``free``.
+
+    At every requested granularity ``p``, the still-unplaced requests with
+    prefix length ``<= p`` need ``sum(2 ** (p - q))`` aligned ``/p`` slots,
+    while the free space offers one such slot per ``/p`` block inside each
+    free piece at least as large.  Checking only the requested prefix
+    lengths suffices: between two consecutive requested lengths both sides
+    of the inequality at least double, so no new violation can appear.
+    """
+    for prefix in set(prefixlens):
+        required = sum(1 << (prefix - q) for q in prefixlens if q <= prefix)
+        available = sum(
+            1 << (prefix - net.prefixlen)
+            for net in free
+            if net.prefixlen <= prefix
+        )
+        if required > available:
+            return False
+    return True
+
+
+def _search(
+    free: Sequence[Network],
+    prefixlens: Sequence[int],
+    max_bits: int,
+    memo: set,
+) -> list[Network] | None:
+    """DFS over candidates in address order; first complete plan is lex-min.
+
+    ``prefixlens[d]`` is placed at depth ``d``; every aligned candidate
+    subnet is tried in increasing network-address order, so the first
+    complete assignment found is the lexicographically smallest feasible
+    sequence.  ``memo`` caches failed ``(depth, free-state)`` keys —
+    feasibility of a state depends only on the remaining free space and
+    the remaining requests, never on how the state was reached.  The
+    traversal is iterative so the request count is not bounded by the
+    interpreter's recursion limit.
+    """
+    if not prefixlens:
+        return []
+
+    def state_key(depth: int, free_nets: Sequence[Network]) -> tuple:
+        return (
+            depth,
+            tuple(
+                (int(net.network_address), net.prefixlen) for net in free_nets
+            ),
+        )
+
+    def enter(depth: int) -> Iterable[Network] | None:
+        """Prune the state at ``depth`` or return its candidate iterator."""
+        key = state_key(depth, frees[depth])
+        if key in memo:
+            return None
+        if not _fits(frees[depth], prefixlens[depth:]):
+            memo.add(key)
+            return None
+        return _aligned_candidates(frees[depth], prefixlens[depth], max_bits)
+
+    # Invariant while ``candidates`` is non-empty: depth d = len(candidates)-1
+    # is the deepest entered state, frees[d] its free list, and ``chosen``
+    # holds the d blocks (depths 0..d-1) that led to it.
+    frees: list[Sequence[Network]] = [list(free)]
+    first = enter(0)
+    if first is None:
+        return None
+    candidates: list[Iterable[Network]] = [first]
+    chosen: list[Network] = []
+
+    while candidates:
+        depth = len(candidates) - 1
+        block = next(candidates[-1], None)
+        if block is None:
+            # Every candidate at this depth failed: memoize and backtrack.
+            memo.add(state_key(depth, frees[depth]))
+            candidates.pop()
+            frees.pop()
+            if chosen:
+                chosen.pop()
+            continue
+        if depth == len(prefixlens) - 1:
+            # Last request placed: the complete, lexicographically smallest
+            # plan, in request order.
+            return [*chosen, block]
+        # Descend: tentatively place the block, then prune or enter the
+        # child state; undo the descend if the child is already infeasible.
+        chosen.append(block)
+        frees.append(_subtract_free(frees[depth], block))
+        child = enter(depth + 1)
+        if child is None:
+            chosen.pop()
+            frees.pop()
+            continue
+        candidates.append(child)
+    return None
+
+
+def allocate(
+    scope_raw: str,
+    occupied_raw: Sequence[str],
+    requests: Sequence[tuple[str, int]],
+) -> dict | None:
+    """Assign one subnet per ``(id, prefix_length)`` request inside ``scope``.
+
+    Allocations are non-overlapping, avoid every occupied CIDR and follow
+    request order; among all complete feasible assignments the one with the
+    lexicographically smallest sequence of network addresses wins.  Returns
+    ``None`` when no complete assignment exists (the caller maps this to
+    HTTP 409 and must not emit partial allocations).
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema):
+    occupied CIDRs share the scope family, lie inside it and do not overlap;
+    request ids are unique; prefix lengths fit the address family.  A
+    malformed value raises :class:`ValueError`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+    max_bits = _MAX_PREFIXLEN[family]
+
+    occupied = [parse_network(item) for item in occupied_raw]
+    # Free space before any allocation: scope minus the occupied CIDRs, as a
+    # minimal, sorted, non-overlapping CIDR list.
+    free = _normalize_family([scope], occupied, family)
+
+    prefixlens = [prefix_length for _, prefix_length in requests]
+    chosen = _search(free, prefixlens, max_bits, memo=set())
+    if chosen is None:
+        return None
+
+    remaining = free
+    for block in chosen:
+        remaining = _subtract_free(remaining, block)
+
+    return {
+        "allocations": [
+            {"id": request_id, "cidr": str(network)}
+            for (request_id, _), network in zip(requests, chosen, strict=True)
+        ],
+        "remaining": [str(net) for net in remaining],
+        # Decimal string: IPv6 remainders exceed JSON's safe integer range.
+        "remaining_addresses": str(
+            sum(net.num_addresses for net in remaining)
+        ),
+    }

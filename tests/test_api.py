@@ -1,0 +1,1033 @@
+"""API-level tests for POST /normalize using FastAPI's TestClient."""
+
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_normalize_basic():
+    response = client.post(
+        "/normalize",
+        json={
+            "allow": ["10.0.0.0/24", "10.0.0.0/24", "2001:db8::/32"],
+            "deny": ["10.0.0.128/25"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ipv4"] == ["10.0.0.0/25"]
+    assert data["ipv6"] == ["2001:db8::/32"]
+    assert data["stats"]["allow"] == {
+        "input": 3, "unique": 2, "duplicates_removed": 1,
+        "ipv4": 1, "ipv6": 1,
+    }
+    assert data["stats"]["deny"] == {
+        "input": 1, "unique": 1, "duplicates_removed": 0,
+        "ipv4": 1, "ipv6": 0,
+    }
+    assert data["stats"]["output"] == {"ipv4": 1, "ipv6": 1, "total": 2}
+
+
+def test_empty_body_defaults_to_empty_lists():
+    response = client.post("/normalize", json={})
+    assert response.status_code == 200
+    assert response.json() == {
+        "ipv4": [],
+        "ipv6": [],
+        "stats": {
+            "allow": {"input": 0, "unique": 0, "duplicates_removed": 0,
+                      "ipv4": 0, "ipv6": 0},
+            "deny": {"input": 0, "unique": 0, "duplicates_removed": 0,
+                     "ipv4": 0, "ipv6": 0},
+            "output": {"ipv4": 0, "ipv6": 0, "total": 0},
+        },
+    }
+
+
+def test_invalid_cidr_returns_422():
+    response = client.post(
+        "/normalize",
+        json={"allow": ["10.0.0.0/24", "bogus"], "deny": []},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "allow" for err in detail)
+
+
+def test_host_bits_return_422():
+    response = client.post(
+        "/normalize",
+        json={"allow": [], "deny": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_wrong_type_returns_422():
+    response = client.post(
+        "/normalize",
+        json={"allow": [10], "deny": []},
+    )
+    assert response.status_code == 422
+
+
+def test_doc_and_openapi_available():
+    assert client.get("/docs").status_code == 200
+    spec = client.get("/openapi.json").json()
+    assert "/normalize" in spec["paths"]
+    assert "/evaluate" in spec["paths"]
+
+
+# --------------------------------------------------------------------------
+# POST /evaluate
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_longest_prefix_deny_tie_and_unmatched():
+    response = client.post(
+        "/evaluate",
+        json={
+            "allow": ["10.0.0.0/24", "10.0.0.0/25", "2001:db8::/32"],
+            "deny": ["10.0.0.0/25"],
+            "addresses": [
+                "10.0.0.1",       # equal-length deny beats allow
+                "10.0.0.200",     # only the broader allow covers this
+                "192.0.2.1",      # no match at all
+                "2001:db8::1",    # IPv6 allow
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == [
+        {"decision": "deny", "matched_cidr": "10.0.0.0/25",
+         "matched_side": "deny"},
+        {"decision": "allow", "matched_cidr": "10.0.0.0/24",
+         "matched_side": "allow"},
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+        {"decision": "allow", "matched_cidr": "2001:db8::/32",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_longer_prefix_beats_broader_deny():
+    response = client.post(
+        "/evaluate",
+        json={
+            "allow": ["10.0.0.0/24"],
+            "deny": ["10.0.0.0/16"],
+            "addresses": ["10.0.0.1"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == [
+        {"decision": "allow", "matched_cidr": "10.0.0.0/24",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_preserves_address_order():
+    response = client.post(
+        "/evaluate",
+        json={
+            "allow": ["10.0.0.0/24"],
+            "deny": ["10.1.0.0/16"],
+            "addresses": ["10.1.0.5", "10.0.0.5", "172.16.0.1", "10.0.0.6"],
+        },
+    )
+    assert response.status_code == 200
+    assert [item["decision"] for item in response.json()] == [
+        "deny", "allow", "unmatched", "allow",
+    ]
+
+
+def test_evaluate_empty_body_defaults_to_empty_lists():
+    response = client.post("/evaluate", json={})
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_evaluate_invalid_address_returns_422():
+    response = client.post(
+        "/evaluate",
+        json={"allow": [], "deny": [], "addresses": ["10.0.0.1", "bogus"]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "addresses" for err in detail)
+
+
+def test_evaluate_address_with_cidr_notation_returns_422():
+    response = client.post(
+        "/evaluate",
+        json={"allow": [], "deny": [], "addresses": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "addresses" for err in response.json()["detail"])
+
+
+def test_evaluate_invalid_cidr_returns_422():
+    response = client.post(
+        "/evaluate",
+        json={"allow": ["10.0.0.1/24"], "deny": [], "addresses": ["10.0.0.1"]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "allow" for err in detail)
+
+    response = client.post(
+        "/evaluate",
+        json={"allow": [], "deny": ["not-a-cidr"], "addresses": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_evaluate_wrong_type_returns_422():
+    response = client.post(
+        "/evaluate",
+        json={"allow": [], "deny": [], "addresses": [10]},
+    )
+    assert response.status_code == 422
+
+
+def test_evaluate_openapi_documents_decision_enum():
+    spec = client.get("/openapi.json").json()
+    operation = spec["paths"]["/evaluate"]["post"]
+    # The response model is a bare array of AddressDecision.
+    response_schema = spec["components"]["schemas"]["AddressDecision"]
+    decision_enum = response_schema["properties"]["decision"]["enum"]
+    assert decision_enum == ["allow", "deny", "unmatched"]
+    side_variants = response_schema["properties"]["matched_side"]["anyOf"]
+    side_enum = next(v["enum"] for v in side_variants if "enum" in v)
+    assert side_enum == ["allow", "deny"]
+    # Named request/response examples are exposed in the OpenAPI document.
+    request_json = operation["requestBody"]["content"]["application/json"]
+    assert "longest_prefix_and_deny_tie_break" in request_json["examples"]
+    response_json = operation["responses"]["200"]["content"]["application/json"]
+    assert "longest_prefix_and_deny_tie_break" in response_json["examples"]
+
+
+# --------------------------------------------------------------------------
+# POST /compare
+# --------------------------------------------------------------------------
+
+
+def test_compare_basic():
+    response = client.post(
+        "/compare",
+        json={
+            "scope": "10.0.0.0/24",
+            "baseline": {"allow": ["10.0.0.0/24"], "deny": []},
+            "candidate": {
+                "allow": ["10.0.0.0/25"],
+                "deny": ["10.0.0.128/26"],
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "differences": [
+            {"cidr": "10.0.0.128/26", "baseline_decision": "allow",
+             "candidate_decision": "deny"},
+            {"cidr": "10.0.0.192/26", "baseline_decision": "allow",
+             "candidate_decision": "unmatched"},
+        ],
+        "transition_counts": {
+            "allow->deny": "64",
+            "allow->unmatched": "64",
+            "deny->allow": "0",
+            "deny->unmatched": "0",
+            "unmatched->allow": "0",
+            "unmatched->deny": "0",
+        },
+    }
+
+
+def test_compare_sibling_halves_merge():
+    response = client.post(
+        "/compare",
+        json={
+            "scope": "10.0.0.0/24",
+            "baseline": {"allow": ["10.0.0.0/24"]},
+            "candidate": {"deny": ["10.0.0.128/26", "10.0.0.192/26"]},
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    # The two equal-transition /26 halves merge into the upper /25.
+    assert data["differences"] == [
+        {"cidr": "10.0.0.0/25", "baseline_decision": "allow",
+         "candidate_decision": "unmatched"},
+        {"cidr": "10.0.0.128/25", "baseline_decision": "allow",
+         "candidate_decision": "deny"},
+    ]
+    assert data["transition_counts"]["allow->deny"] == "128"
+
+
+def test_compare_identical_policies_return_empty():
+    response = client.post(
+        "/compare",
+        json={
+            "scope": "10.0.0.0/24",
+            "baseline": {"allow": ["10.0.0.0/24"], "deny": ["10.0.0.0/25"]},
+            "candidate": {"allow": ["10.0.0.0/24"], "deny": ["10.0.0.0/25"]},
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["differences"] == []
+    assert set(data["transition_counts"]) == {
+        "allow->deny", "allow->unmatched", "deny->allow",
+        "deny->unmatched", "unmatched->allow", "unmatched->deny",
+    }
+    assert all(value == "0" for value in data["transition_counts"].values())
+
+
+def test_compare_defaults_missing_policies_to_empty():
+    response = client.post("/compare", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 200
+    assert response.json()["differences"] == []
+
+
+def test_compare_ipv6_decimal_string_counts():
+    response = client.post(
+        "/compare",
+        json={
+            "scope": "2001:db8::/32",
+            "candidate": {"allow": ["2001:db8::/32"]},
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["differences"] == [
+        {"cidr": "2001:db8::/32", "baseline_decision": "unmatched",
+         "candidate_decision": "allow"},
+    ]
+    assert data["transition_counts"]["unmatched->allow"] == str(2 ** 96)
+
+
+def test_compare_invalid_scope_cidr_returns_422():
+    response = client.post(
+        "/compare",
+        json={"scope": "bogus", "baseline": {}, "candidate": {}},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_compare_scope_host_bits_return_422():
+    response = client.post(
+        "/compare",
+        json={"scope": "10.0.0.1/24", "baseline": {}, "candidate": {}},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_compare_missing_scope_returns_422():
+    response = client.post("/compare", json={"baseline": {}, "candidate": {}})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_compare_wrong_scope_type_returns_422():
+    response = client.post("/compare", json={"scope": 10})
+    assert response.status_code == 422
+
+
+def test_compare_invalid_nested_cidr_returns_422():
+    response = client.post(
+        "/compare",
+        json={
+            "scope": "10.0.0.0/24",
+            "baseline": {"allow": ["10.0.0.1/24"]},
+            "candidate": {},
+        },
+    )
+    assert response.status_code == 422
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any(loc[-1] == "allow" and "baseline" in loc for loc in locs)
+
+    response = client.post(
+        "/compare",
+        json={
+            "scope": "10.0.0.0/24",
+            "candidate": {"deny": ["not-a-cidr"]},
+        },
+    )
+    assert response.status_code == 422
+    locs = [tuple(err["loc"]) for err in response.json()["detail"]]
+    assert any(loc[-1] == "deny" and "candidate" in loc for loc in locs)
+
+
+def test_compare_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/compare" in spec["paths"]
+    assert spec["components"]["schemas"]["CompareDifference"]["properties"][
+        "baseline_decision"
+    ]["enum"] == ["allow", "deny", "unmatched"]
+    operation = spec["paths"]["/compare"]["post"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "deny_supernet_holes" in examples
+
+
+# --------------------------------------------------------------------------
+# POST /audit-rules
+# --------------------------------------------------------------------------
+
+
+def test_audit_rules_basic_effective_shadowed_and_out_of_scope():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": [
+                "10.0.0.0/24",     # wins the upper half
+                "10.0.0.0/25",     # deny beats it at equal length
+                "10.0.0.0/25",     # duplicate, also loses
+            ],
+            "deny": [
+                "10.0.0.0/25",     # wins the lower half
+                "10.1.0.0/16",     # disjoint from scope
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "allow": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "status": "effective", "witness": "10.0.0.128",
+             "shadowed_by": None},
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/25",
+             "status": "shadowed", "witness": None,
+             "shadowed_by": [{"side": "deny", "index": 0}]},
+            {"side": "allow", "index": 2, "cidr": "10.0.0.0/25",
+             "status": "shadowed", "witness": None,
+             "shadowed_by": [{"side": "deny", "index": 0}]},
+        ],
+        "deny": [
+            {"side": "deny", "index": 0, "cidr": "10.0.0.0/25",
+             "status": "effective", "witness": "10.0.0.0",
+             "shadowed_by": None},
+            {"side": "deny", "index": 1, "cidr": "10.1.0.0/16",
+             "status": "out_of_scope", "witness": None,
+             "shadowed_by": None},
+        ],
+    }
+
+
+def test_audit_rules_response_follows_input_order():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            # Deliberately unordered by address.
+            "allow": ["10.0.0.128/25", "10.0.0.0/25", "10.0.0.0/24"],
+            "deny": ["10.0.0.192/26", "10.0.0.0/25"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert [item["cidr"] for item in data["allow"]] == [
+        "10.0.0.128/25", "10.0.0.0/25", "10.0.0.0/24",
+    ]
+    assert [item["index"] for item in data["allow"]] == [0, 1, 2]
+    assert [item["cidr"] for item in data["deny"]] == [
+        "10.0.0.192/26", "10.0.0.0/25",
+    ]
+    assert [item["index"] for item in data["deny"]] == [0, 1]
+
+
+def test_audit_rules_witness_is_numerically_smallest_winning_address():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24"],
+            "deny": ["10.0.0.0/26", "10.0.0.64/26", "10.0.0.128/26"],
+        },
+    )
+    assert response.status_code == 200
+    allow = response.json()["allow"][0]
+    # Only the top /26 survives for the allow.
+    assert allow["status"] == "effective"
+    assert allow["witness"] == "10.0.0.192"
+
+
+def test_audit_rules_duplicate_denies_keep_earliest_priority():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": [],
+            "deny": ["10.0.0.0/24", "10.0.0.0/24"],
+        },
+    )
+    assert response.status_code == 200
+    deny = response.json()["deny"]
+    assert deny[0]["status"] == "effective"
+    assert deny[0]["witness"] == "10.0.0.0"
+    assert deny[1] == {
+        "side": "deny", "index": 1, "cidr": "10.0.0.0/24",
+        "status": "shadowed", "witness": None,
+        "shadowed_by": [{"side": "deny", "index": 0}],
+    }
+
+
+def test_audit_rules_ipv6():
+    response = client.post(
+        "/audit-rules",
+        json={
+            "scope": "2001:db8::/126",
+            "allow": ["2001:db8::/126", "2001:db8::3/128"],
+            "deny": ["2001:db8::3/128"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allow"][0] == {
+        "side": "allow", "index": 0, "cidr": "2001:db8::/126",
+        "status": "effective", "witness": "2001:db8::",
+        "shadowed_by": None}
+    assert data["allow"][1]["status"] == "shadowed"
+    assert data["allow"][1]["shadowed_by"] == [
+        {"side": "deny", "index": 0}]
+    assert data["deny"][0] == {
+        "side": "deny", "index": 0, "cidr": "2001:db8::3/128",
+        "status": "effective", "witness": "2001:db8::3",
+        "shadowed_by": None}
+
+
+def test_audit_rules_empty_rules():
+    response = client.post("/audit-rules", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 200
+    assert response.json() == {"allow": [], "deny": []}
+
+
+def test_audit_rules_invalid_scope_returns_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "bogus", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_audit_rules_scope_host_bits_return_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.1/24", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_audit_rules_missing_scope_returns_422():
+    response = client.post("/audit-rules", json={"allow": [], "deny": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_audit_rules_invalid_rule_cidr_returns_422():
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "allow" for err in response.json()["detail"])
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "deny": ["not-a-cidr"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_audit_rules_family_mismatch_returns_422():
+    # Unlike /compare, a rule of the other family is a hard 422 here.
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "10.0.0.0/24", "allow": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+    msg = response.json()["detail"][0]["msg"]
+    assert "address family" in msg
+
+    response = client.post(
+        "/audit-rules",
+        json={"scope": "2001:db8::/32", "deny": ["10.0.0.0/8"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_audit_rules_wrong_type_returns_422():
+    response = client.post("/audit-rules", json={"scope": 10})
+    assert response.status_code == 422
+
+
+def test_audit_rules_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/audit-rules" in spec["paths"]
+    operation = spec["paths"]["/audit-rules"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "effective_shadowed_and_out_of_scope" in examples
+    schema = spec["components"]["schemas"]["RuleAuditResult"]
+    assert schema["properties"]["status"]["enum"] == [
+        "effective", "shadowed", "out_of_scope"]
+    ref_schema = spec["components"]["schemas"]["RuleReference"]
+    assert ref_schema["properties"]["side"]["enum"] == ["allow", "deny"]
+
+
+# --------------------------------------------------------------------------
+# POST /minimize-policy
+# --------------------------------------------------------------------------
+
+
+def test_minimize_policy_basic_subset_with_witnesses():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24", "10.0.0.0/25"],
+            "deny": ["10.0.0.128/25"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "witness": "10.0.0.0"},
+            {"side": "deny", "index": 0, "cidr": "10.0.0.128/25",
+             "witness": "10.0.0.128"},
+        ],
+        "removed": [
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/25"},
+        ],
+    }
+
+
+def test_minimize_policy_drops_out_of_scope_and_shadowed_rules():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24", "10.0.0.0/25"],
+            "deny": ["10.0.0.0/25", "10.1.0.0/16"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert [(item["side"], item["index"]) for item in data["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+    assert [(item["side"], item["index"]) for item in data["removed"]] == [
+        ("allow", 1), ("deny", 1),
+    ]
+    # Removed references never carry a witness.
+    assert all("witness" not in item for item in data["removed"])
+    # allow /24 wins only the upper half once the narrow allow is dropped.
+    assert data["retained"][0]["witness"] == "10.0.0.128"
+
+
+def test_minimize_policy_references_follow_original_input_order():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/30",
+            "allow": ["10.0.0.0/32", "10.0.0.1/32", "10.0.0.2/32"],
+            "deny": ["10.0.0.3/32"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert [(item["side"], item["index"]) for item in data["retained"]] == [
+        ("allow", 0), ("allow", 1), ("allow", 2), ("deny", 0),
+    ]
+    assert [item["witness"] for item in data["retained"]] == [
+        "10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3",
+    ]
+    assert data["removed"] == []
+
+
+def test_minimize_policy_empty_rules():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": [], "deny": []},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"retained": [], "removed": []}
+
+
+def test_minimize_policy_ipv6():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "2001:db8::/120",
+            "allow": ["2001:db8::/120"],
+            "deny": ["2001:db8::/121"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert [(item["side"], item["index"]) for item in data["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+    assert data["retained"][0]["witness"] == "2001:db8::80"
+    assert data["retained"][1]["witness"] == "2001:db8::"
+
+
+def test_minimize_policy_more_than_16_rules_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/26"] * 9,
+            "deny": ["10.0.0.64/26"] * 8,
+        },
+    )
+    assert response.status_code == 422
+    assert "16" in response.json()["detail"][0]["msg"]
+
+
+def test_minimize_policy_exactly_16_rules_is_accepted():
+    response = client.post(
+        "/minimize-policy",
+        json={
+            "scope": "10.0.0.0/24",
+            "allow": ["10.0.0.0/24"] * 16,
+            "deny": [],
+        },
+    )
+    assert response.status_code == 200
+    # Duplicates collapse to the single earliest copy.
+    assert [(item["side"], item["index"])
+            for item in response.json()["retained"]] == [("allow", 0)]
+    assert len(response.json()["removed"]) == 15
+
+
+def test_minimize_policy_family_mismatch_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "2001:db8::/32", "deny": ["10.0.0.0/8"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_minimize_policy_invalid_scope_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "bogus", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_minimize_policy_scope_host_bits_return_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.1/24", "allow": [], "deny": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+
+def test_minimize_policy_missing_scope_returns_422():
+    response = client.post("/minimize-policy", json={"allow": [], "deny": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_minimize_policy_invalid_rule_cidr_returns_422():
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "allow": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "allow" for err in response.json()["detail"])
+
+    response = client.post(
+        "/minimize-policy",
+        json={"scope": "10.0.0.0/24", "deny": ["not-a-cidr"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "deny" for err in response.json()["detail"])
+
+
+def test_minimize_policy_wrong_type_returns_422():
+    response = client.post("/minimize-policy", json={"scope": 10})
+    assert response.status_code == 422
+
+
+def test_minimize_policy_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/minimize-policy" in spec["paths"]
+    operation = spec["paths"]["/minimize-policy"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "minimum_subset_with_witnesses" in examples
+    assert "too_many_rules" in examples
+    response_schema = spec["components"]["schemas"]["MinimizePolicyResponse"]
+    assert set(response_schema["properties"]) == {"retained", "removed"}
+    retained_schema = spec["components"]["schemas"]["RetainedRule"]
+    assert set(retained_schema["properties"]) == {
+        "side", "index", "cidr", "witness"}
+
+
+# --------------------------------------------------------------------------
+# POST /allocate
+# --------------------------------------------------------------------------
+
+
+def test_allocate_basic_preserves_request_order():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.0/25"],
+            "requests": [
+                {"id": "b", "prefix_length": 26},
+                {"id": "a", "prefix_length": 26},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    # Response follows request order (b before a), not id or address order.
+    assert data["allocations"] == [
+        {"id": "b", "cidr": "10.0.0.128/26"},
+        {"id": "a", "cidr": "10.0.0.192/26"},
+    ]
+    assert data["remaining"] == []
+    assert data["remaining_addresses"] == "0"
+
+
+def test_allocate_backtracks_to_lexicographically_smallest_plan():
+    # Free space: 10.0.0.0/24 and 10.0.1.128/25.  Giving "small" the
+    # lowest /25 (10.0.0.0/25 or 10.0.0.128/25) leaves no room for the
+    # /24, so the search must backtrack and place "small" at 10.0.1.128/25.
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/23",
+            "occupied": ["10.0.1.0/25"],
+            "requests": [
+                {"id": "small", "prefix_length": 25},
+                {"id": "big", "prefix_length": 24},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allocations"] == [
+        {"id": "small", "cidr": "10.0.1.128/25"},
+        {"id": "big", "cidr": "10.0.0.0/24"},
+    ]
+    assert data["remaining"] == []
+    assert data["remaining_addresses"] == "0"
+
+
+def test_allocate_remaining_is_minimal_cidr_set():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.64/26", "10.0.0.128/26"],
+            "requests": [{"id": "first", "prefix_length": 26}],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allocations"] == [{"id": "first", "cidr": "10.0.0.0/26"}]
+    # 10.0.0.192/26 survives whole; the freed /26 siblings are not merged
+    # across the occupied blocks.
+    assert data["remaining"] == ["10.0.0.192/26"]
+    assert data["remaining_addresses"] == "64"
+
+
+def test_allocate_empty_requests_returns_free_space():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["10.0.0.0/25"]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "allocations": [],
+        "remaining": ["10.0.0.128/25"],
+        "remaining_addresses": "128",
+    }
+
+
+def test_allocate_ipv6_decimal_string_count():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "2001:db8::/126",
+            "occupied": ["2001:db8::1/128"],
+            "requests": [{"id": "node", "prefix_length": 128}],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allocations"] == [{"id": "node", "cidr": "2001:db8::/128"}]
+    assert data["remaining"] == ["2001:db8::2/127"]
+    assert data["remaining_addresses"] == "2"
+
+
+def test_allocate_infeasible_returns_409_without_partial_allocation():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.0/25"],
+            "requests": [
+                {"id": "x", "prefix_length": 25},
+                {"id": "y", "prefix_length": 25},
+            ],
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert "allocations" not in body
+    assert "remaining" not in body
+
+
+def test_allocate_prefix_shorter_than_scope_returns_409():
+    # A /16 can never be a subnet of a /24 scope: unsatisfiable, not invalid.
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "requests": [{"id": "wan", "prefix_length": 16}],
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_allocate_duplicate_id_returns_422():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "requests": [
+                {"id": "dup", "prefix_length": 25},
+                {"id": "dup", "prefix_length": 26},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert "dup" in response.json()["detail"][0]["msg"]
+
+
+def test_allocate_invalid_prefix_length_returns_422():
+    for bad in (-1, 33):
+        response = client.post(
+            "/allocate",
+            json={
+                "scope": "10.0.0.0/24",
+                "requests": [{"id": "x", "prefix_length": bad}],
+            },
+        )
+        assert response.status_code == 422, bad
+    # /33 is fine for an IPv6 scope, /129 is not.
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "2001:db8::/32",
+            "requests": [{"id": "x", "prefix_length": 129}],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_allocate_invalid_scope_or_occupied_cidr_returns_422():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.1/24", "requests": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["bogus"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "occupied" for err in response.json()["detail"]
+    )
+
+
+def test_allocate_occupied_wrong_family_returns_422():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+
+
+def test_allocate_occupied_outside_scope_returns_422():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["10.0.1.0/24"]},
+    )
+    assert response.status_code == 422
+
+
+def test_allocate_overlapping_occupied_returns_422():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.0/25", "10.0.0.64/26"],
+        },
+    )
+    assert response.status_code == 422
+    assert "overlap" in response.json()["detail"][0]["msg"]
+
+
+def test_allocate_missing_scope_returns_422():
+    response = client.post("/allocate", json={"requests": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_allocate_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    operation = spec["paths"]["/allocate"]["post"]
+    assert "409" in operation["responses"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "lexicographic_with_backtracking" in examples
+    schema = spec["components"]["schemas"]["AllocateResponse"]
+    assert set(schema["properties"]) == {
+        "allocations", "remaining", "remaining_addresses",
+    }

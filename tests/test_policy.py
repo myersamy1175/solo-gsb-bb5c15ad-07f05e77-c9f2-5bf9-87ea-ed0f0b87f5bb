@@ -1,0 +1,1430 @@
+"""Unit + property tests for the CIDR normalization core (stdlib only)."""
+
+from __future__ import annotations
+
+import ipaddress
+import random
+
+import pytest
+
+from app.policy import (
+    _normalize_family,
+    allocate,
+    audit_rules,
+    compare,
+    evaluate,
+    minimize_policy,
+    normalize,
+    parse_address,
+    parse_network,
+    TRANSITION_KEYS,
+)
+
+
+def ref_subtract(allow, deny):
+    """Reference implementation using ipaddress.address_exclude."""
+    nets = list(ipaddress.collapse_addresses(allow))
+    for d in ipaddress.collapse_addresses(deny):
+        nxt = []
+        for n in nets:
+            if d == n or n.subnet_of(d):
+                continue
+            if d.subnet_of(n):
+                nxt.extend(n.address_exclude(d))
+            else:
+                nxt.append(n)
+        nets = nxt
+    return set(ipaddress.collapse_addresses(nets))
+
+
+def _strings(networks):
+    return {str(n) for n in networks}
+
+
+def test_simple_cut_through_ipv4():
+    # 10.0.0.128/26 cuts 10.0.0.0/24 into two prefixes.
+    result = normalize(["10.0.0.0/24"], ["10.0.0.128/26"])
+    assert result["ipv4"] == ["10.0.0.0/25", "10.0.0.192/26"]
+
+
+def test_sibling_halves_merge_back():
+    # Deny a hole whose leftovers are the two halves; they must merge.
+    result = normalize(["10.0.0.0/24"], ["10.0.0.128/25"])
+    assert result["ipv4"] == ["10.0.0.0/25"]
+
+
+def test_nested_split_minimal():
+    # Two adjacent /26 denies in the lower half leave one /25 survivor...
+    result = normalize(
+        ["10.0.0.0/24"],
+        ["10.0.0.0/26", "10.0.0.64/26"],
+    )
+    assert result["ipv4"] == ["10.0.0.128/25"]
+
+
+def test_non_sibling_adjacent_prefixes_do_not_merge():
+    # 10.0.0.0/25 and 10.0.0.128/26 are adjacent but unequal siblings of no
+    # common pair; minimal canonical remainder of /24 minus 10.0.0.192/26 is
+    # exactly these two pieces (10.0.0.0/24 \\ 10.0.0.192/26).
+    result = normalize(["10.0.0.0/24"], ["10.0.0.192/26"])
+    assert result["ipv4"] == ["10.0.0.0/25", "10.0.0.128/26"]
+
+
+def test_deny_swallows_allow_entirely():
+    result = normalize(["10.0.0.0/24"], ["10.0.0.0/16"])
+    assert result["ipv4"] == []
+
+
+def test_deny_equals_allow():
+    result = normalize(["10.0.0.0/24"], ["10.0.0.0/24"])
+    assert result["ipv4"] == []
+
+
+def test_overlapping_allow_inputs_are_collapsed():
+    result = normalize(["10.0.0.0/25", "10.0.0.128/25"], [])
+    assert result["ipv4"] == ["10.0.0.0/24"]
+
+
+def test_duplicates_are_deduplicated():
+    result = normalize(
+        ["10.0.0.0/24", "10.0.0.0/24", "10.0.0.1/32"],
+        ["10.0.0.0/8", "10.0.0.0/8"],
+    )
+    stats = result["stats"]
+    assert stats["allow"] == {"input": 3, "unique": 2, "duplicates_removed": 1,
+                              "ipv4": 2, "ipv6": 0}
+    assert stats["deny"] == {"input": 2, "unique": 1, "duplicates_removed": 1,
+                             "ipv4": 1, "ipv6": 0}
+    assert stats["output"] == {"ipv4": 0, "ipv6": 0, "total": 0}
+
+
+def test_mixed_families_are_independent():
+    result = normalize(
+        ["10.0.0.0/24", "2001:db8::/32"],
+        ["10.0.0.128/25", "2001:db8:1::/48"],
+    )
+    assert result["ipv4"] == ["10.0.0.0/25"]
+    assert result["ipv6"] == ["2001:db8::/48", "2001:db8:2::/47",
+                              "2001:db8:4::/46", "2001:db8:8::/45",
+                              "2001:db8:10::/44", "2001:db8:20::/43",
+                              "2001:db8:40::/42", "2001:db8:80::/41",
+                              "2001:db8:100::/40", "2001:db8:200::/39",
+                              "2001:db8:400::/38", "2001:db8:800::/37",
+                              "2001:db8:1000::/36", "2001:db8:2000::/35",
+                              "2001:db8:4000::/34", "2001:db8:8000::/33"]
+
+
+def test_sorting_is_stable_by_network_then_prefixlen():
+    result = normalize(
+        ["192.0.2.0/24", "10.0.0.0/8", "172.16.0.0/12"],
+        [],
+    )
+    assert result["ipv4"] == ["10.0.0.0/8", "172.16.0.0/12", "192.0.2.0/24"]
+
+
+def test_bare_address_means_host_prefix():
+    result = normalize(["10.0.0.1", "::1"], [])
+    assert result["ipv4"] == ["10.0.0.1/32"]
+    assert result["ipv6"] == ["::1/128"]
+
+
+def test_host_bits_rejected():
+    with pytest.raises(ValueError):
+        parse_network("10.0.0.1/24")
+    with pytest.raises(ValueError):
+        parse_network("2001:db8::1/32")
+
+
+def test_garbage_rejected():
+    for bad in ["not-a-cidr", "10.0.0.0/33", "999.0.0.0/8", "", "10.0.0.0/"]:
+        with pytest.raises(ValueError):
+            parse_network(bad)
+
+
+def test_host_prefix_subtraction():
+    result = normalize(["10.0.0.0/30"], ["10.0.0.1/32", "10.0.0.2/32"])
+    assert result["ipv4"] == ["10.0.0.0/32", "10.0.0.3/32"]
+
+
+def test_output_is_non_overlapping_and_minimal():
+    result = normalize(
+        ["10.0.0.0/23", "10.0.2.0/24", "192.168.0.0/16"],
+        ["10.0.1.0/24", "192.168.255.0/24", "10.0.0.128/25"],
+    )
+    nets = [ipaddress.ip_network(s) for s in result["ipv4"]]
+    for i, a in enumerate(nets):
+        for b in nets[i + 1:]:
+            assert not a.overlaps(b)
+    # No pair of complete sibling prefixes may remain (they would be merged).
+    for i, a in enumerate(nets):
+        if a.prefixlen == 0:
+            continue
+        supernet = a.supernet()
+        siblings = [n for n in nets if n != a and n.subnet_of(supernet)
+                    and n.prefixlen == a.prefixlen]
+        # If both halves of the supernet are present, collapse would have
+        # merged them, so at most a alone sits directly under that supernet.
+        assert not (siblings and set(supernet.subnets()) <= set(nets))
+
+
+@pytest.mark.parametrize("seed", range(64))
+def test_matches_ipaddress_reference_ipv4(seed):
+    rng = random.Random(seed)
+    base = ipaddress.IPv4Address(0x0A000000)  # 10.0.0.0
+    allow, deny = [], []
+    for _ in range(rng.randint(1, 12)):
+        shift = rng.randint(0, 20)
+        addr = int(base) + (rng.getrandbits(shift) << (24 - shift) if shift else 0)
+        allow.append(ipaddress.IPv4Network((addr, rng.randint(8, 32)), strict=False))
+    for _ in range(rng.randint(0, 12)):
+        shift = rng.randint(0, 20)
+        addr = int(base) + (rng.getrandbits(shift) << (24 - shift) if shift else 0)
+        deny.append(ipaddress.IPv4Network((addr, rng.randint(8, 32)), strict=False))
+
+    expected = ref_subtract(allow, deny)
+    actual = set(_normalize_family(allow, deny, ipaddress.IPv4Network))
+    assert actual == expected
+
+
+@pytest.mark.parametrize("seed", range(32))
+def test_matches_ipaddress_reference_ipv6(seed):
+    rng = random.Random(1000 + seed)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+
+    def random_net():
+        # Pick a host part within the 2001:db8::/32 block so the address can
+        # never overflow 2**128, then mask it to the chosen prefix length.
+        host = rng.randrange(2 ** 96)
+        prefixlen = rng.randint(32, 120)
+        addr = (base | host) & (~((1 << (128 - prefixlen)) - 1))
+        return ipaddress.IPv6Network((addr, prefixlen), strict=False)
+
+    allow = [random_net() for _ in range(rng.randint(1, 8))]
+    deny = [random_net() for _ in range(rng.randint(0, 8))]
+
+    expected = ref_subtract(allow, deny)
+    actual = set(_normalize_family(allow, deny, ipaddress.IPv6Network))
+    assert actual == expected
+
+
+# --------------------------------------------------------------------------
+# evaluate: longest-prefix matching
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_longest_prefix_wins():
+    # The more specific allow /25 must beat the broader allow /24.
+    result = evaluate(
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        [],
+        ["10.0.0.1", "10.0.0.200"],
+    )
+    assert result == [
+        {"decision": "allow", "matched_cidr": "10.0.0.0/25",
+         "matched_side": "allow"},
+        {"decision": "allow", "matched_cidr": "10.0.0.0/24",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_deny_beats_allow_at_equal_length():
+    result = evaluate(
+        ["10.0.0.0/24"],
+        ["10.0.0.0/25"],
+        ["10.0.0.1", "10.0.0.200"],
+    )
+    assert result[0] == {
+        "decision": "deny", "matched_cidr": "10.0.0.0/25",
+        "matched_side": "deny",
+    }
+    # Only the broader allow covers the upper half.
+    assert result[1] == {
+        "decision": "allow", "matched_cidr": "10.0.0.0/24",
+        "matched_side": "allow",
+    }
+
+
+def test_evaluate_longer_prefix_always_wins_over_side():
+    # Even though the /16 is deny, the longer allow /24 must win inside it.
+    result = evaluate(
+        ["10.0.0.0/24"],
+        ["10.0.0.0/16"],
+        ["10.0.0.1"],
+    )
+    assert result == [
+        {"decision": "allow", "matched_cidr": "10.0.0.0/24",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_stable_tie_break_keeps_first_list_entry():
+    # Two identical allow entries: the earlier index wins; its canonical
+    # representation is reported, which is the same string either way, so
+    # also verify with two distinct equal-length matches is impossible
+    # (a host belongs to only one network of a given prefix length); instead
+    # assert the earlier duplicate does not produce a surprising result.
+    result = evaluate(
+        ["10.0.0.0/24", "10.0.0.0/24"],
+        ["10.0.0.0/24"],
+        ["10.0.0.1"],
+    )
+    assert result[0]["decision"] == "deny"
+    assert result[0]["matched_cidr"] == "10.0.0.0/24"
+
+    # Equal-length allow/allow duplicates remain stable allow decisions.
+    result = evaluate(
+        ["10.0.0.0/24", "10.0.0.0/24"], [], ["10.0.0.1"],
+    )
+    assert result[0] == {
+        "decision": "allow", "matched_cidr": "10.0.0.0/24",
+        "matched_side": "allow",
+    }
+
+
+def test_evaluate_unmatched_is_null():
+    result = evaluate(["10.0.0.0/8"], ["10.1.0.0/16"], ["192.0.2.1"])
+    assert result == [
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+    ]
+
+
+def test_evaluate_order_is_preserved():
+    addresses = ["10.0.0.2", "10.0.0.1", "10.1.0.1", "192.0.2.1"]
+    result = evaluate(["10.0.0.0/24"], ["10.1.0.0/16"], addresses)
+    assert [item["decision"] for item in result] == [
+        "allow", "allow", "deny", "unmatched",
+    ]
+    assert [item["matched_cidr"] for item in result] == [
+        "10.0.0.0/24", "10.0.0.0/24", "10.1.0.0/16", None,
+    ]
+
+
+def test_evaluate_mixed_families_are_independent():
+    result = evaluate(
+        ["10.0.0.0/8", "2001:db8::/32"],
+        ["10.1.0.0/16", "2001:db8:1::/48"],
+        ["10.1.0.1", "2001:db8:1::1", "2001:db8::1"],
+    )
+    assert result == [
+        {"decision": "deny", "matched_cidr": "10.1.0.0/16",
+         "matched_side": "deny"},
+        {"decision": "deny", "matched_cidr": "2001:db8:1::/48",
+         "matched_side": "deny"},
+        {"decision": "allow", "matched_cidr": "2001:db8::/32",
+         "matched_side": "allow"},
+    ]
+
+
+def test_evaluate_empty_inputs():
+    assert evaluate([], [], ["10.0.0.1"]) == [
+        {"decision": "unmatched", "matched_cidr": None, "matched_side": None},
+    ]
+    assert evaluate([], [], []) == []
+
+
+def test_evaluate_bare_host_prefix_cidr_entries_match():
+    # A bare CIDR-list entry is a host prefix and matches that one address.
+    result = evaluate(["10.0.0.1"], [], ["10.0.0.1", "10.0.0.2"])
+    assert result[0] == {
+        "decision": "allow", "matched_cidr": "10.0.0.1/32",
+        "matched_side": "allow",
+    }
+    assert result[1]["decision"] == "unmatched"
+
+
+def test_parse_address_rejects_cidr_and_garbage():
+    assert parse_address("10.0.0.1") == ipaddress.IPv4Address("10.0.0.1")
+    assert parse_address(" 2001:db8::1 ") == ipaddress.IPv6Address("2001:db8::1")
+    for bad in ["10.0.0.1/24", "10.0.0.1/32", "bogus", "999.0.0.1", ""]:
+        with pytest.raises(ValueError):
+            parse_address(bad)
+    with pytest.raises(ValueError):
+        parse_address(10)
+
+
+# --------------------------------------------------------------------------
+# compare: scope partitioning and baseline/candidate diff
+# --------------------------------------------------------------------------
+
+
+def test_compare_basic_two_transitions():
+    result = compare(
+        "10.0.0.0/24",
+        ["10.0.0.0/24"], [],
+        ["10.0.0.0/25"], ["10.0.0.128/26"],
+    )
+    assert result["differences"] == [
+        {"cidr": "10.0.0.128/26", "baseline_decision": "allow",
+         "candidate_decision": "deny"},
+        {"cidr": "10.0.0.192/26", "baseline_decision": "allow",
+         "candidate_decision": "unmatched"},
+    ]
+    assert result["transition_counts"] == {
+        "allow->deny": "64",
+        "allow->unmatched": "64",
+        "deny->allow": "0",
+        "deny->unmatched": "0",
+        "unmatched->allow": "0",
+        "unmatched->deny": "0",
+    }
+
+
+def test_compare_identical_policies_have_no_differences():
+    result = compare(
+        "10.0.0.0/24",
+        ["10.0.0.0/25"], ["10.0.0.128/26"],
+        ["10.0.0.0/25"], ["10.0.0.128/26"],
+    )
+    assert result["differences"] == []
+    assert all(value == "0" for value in result["transition_counts"].values())
+
+
+def test_compare_sibling_regions_merge_recursively():
+    # Candidate denies the whole upper /25 via two /26 halves; the two
+    # equal-transition sibling halves must merge into one /25.
+    result = compare(
+        "10.0.0.0/24",
+        ["10.0.0.0/24"], [],
+        [], ["10.0.0.128/26", "10.0.0.192/26"],
+    )
+    assert result["differences"] == [
+        {"cidr": "10.0.0.0/25", "baseline_decision": "allow",
+         "candidate_decision": "unmatched"},
+        {"cidr": "10.0.0.128/25", "baseline_decision": "allow",
+         "candidate_decision": "deny"},
+    ]
+    assert result["transition_counts"]["allow->deny"] == "128"
+    assert result["transition_counts"]["allow->unmatched"] == "128"
+
+
+def test_compare_deny_wins_equal_length_tie():
+    # Equal /25 allow and deny in candidate: lower half denies; upper half,
+    # covered by neither candidate entry, becomes unmatched.
+    result = compare(
+        "10.0.0.0/24",
+        ["10.0.0.0/24"], [],
+        ["10.0.0.0/25"], ["10.0.0.0/25"],
+    )
+    assert result["differences"] == [
+        {"cidr": "10.0.0.0/25", "baseline_decision": "allow",
+         "candidate_decision": "deny"},
+        {"cidr": "10.0.0.128/25", "baseline_decision": "allow",
+         "candidate_decision": "unmatched"},
+    ]
+
+
+def test_compare_longer_prefix_beats_broader_side():
+    result = compare(
+        "10.0.0.0/24",
+        [], [],
+        ["10.0.0.0/24"], ["10.0.0.0/16"],
+    )
+    assert result["differences"] == [
+        {"cidr": "10.0.0.0/24", "baseline_decision": "unmatched",
+         "candidate_decision": "allow"},
+    ]
+
+
+def test_compare_adjacent_unequal_lengths_do_not_merge():
+    # 128/26 allow->unmatched and 192/26 allow->deny are sibling /26s but
+    # carry different transitions, so they must stay separate.
+    result = compare(
+        "10.0.0.0/24",
+        ["10.0.0.0/24"], [],
+        ["10.0.0.0/25"], ["10.0.0.192/26"],
+    )
+    assert result["differences"] == [
+        {"cidr": "10.0.0.128/26", "baseline_decision": "allow",
+         "candidate_decision": "unmatched"},
+        {"cidr": "10.0.0.192/26", "baseline_decision": "allow",
+         "candidate_decision": "deny"},
+    ]
+
+
+def test_compare_supernet_entry_outside_scope_still_applies():
+    # Both sides share a broader allow; inside the narrower scope nothing
+    # changes, even though the scope itself is not listed.
+    result = compare(
+        "10.0.0.0/25",
+        ["10.0.0.0/24"], [],
+        ["10.0.0.0/24"], [],
+    )
+    assert result["differences"] == []
+
+
+def test_compare_other_family_entries_are_ignored():
+    result = compare(
+        "10.0.0.0/24",
+        [], ["2001:db8::/32"],
+        ["2001:db8::/32"], [],
+    )
+    assert result["differences"] == []
+
+
+def test_compare_ipv6_scope_and_decimal_string_counts():
+    result = compare(
+        "2001:db8::/32",
+        [], [],
+        ["2001:db8::/32"], [],
+    )
+    assert result["differences"] == [
+        {"cidr": "2001:db8::/32", "baseline_decision": "unmatched",
+         "candidate_decision": "allow"},
+    ]
+    # Count is a decimal string even at IPv6 magnitudes.
+    assert result["transition_counts"]["unmatched->allow"] == str(2 ** 96)
+    assert isinstance(result["transition_counts"]["unmatched->allow"], str)
+
+
+def test_compare_host_prefix_scope():
+    result = compare("10.0.0.5/32", [], [], ["10.0.0.5"], [])
+    assert result["differences"] == [
+        {"cidr": "10.0.0.5/32", "baseline_decision": "unmatched",
+         "candidate_decision": "allow"},
+    ]
+
+
+def test_compare_invalid_scope_raises():
+    for bad in ["10.0.0.1/24", "bogus", "10.0.0.0/33", ""]:
+        with pytest.raises(ValueError):
+            compare(bad, [], [], [], [])
+
+
+def _point_decisions(allow_raw, deny_raw, addresses):
+    """evaluate() decisions for a list of bare addresses."""
+    return [
+        item["decision"]
+        for item in evaluate(allow_raw, deny_raw, addresses)
+    ]
+
+
+def _assert_compare_exhaustive(scope, base_a, base_d, cand_a, cand_d):
+    """Check compare() against per-address /evaluate over a small scope."""
+    scope_net = ipaddress.ip_network(scope)
+
+    result = compare(scope, base_a, base_d, cand_a, cand_d)
+    blocks = [ipaddress.ip_network(d["cidr"]) for d in result["differences"]]
+
+    # Enumerate every address of the scope (including network/broadcast,
+    # which .hosts() omits for IPv4).
+    start = int(scope_net.network_address)
+    all_hosts = [
+        ipaddress.ip_address(start + offset)
+        for offset in range(scope_net.num_addresses)
+    ]
+    addresses = [str(host) for host in all_hosts]
+    base_point = _point_decisions(base_a, base_d, addresses)
+    cand_point = _point_decisions(cand_a, cand_d, addresses)
+
+    # Output blocks are strict subnets of scope, non-overlapping, and carry a
+    # genuine change.
+    for diff, network in zip(result["differences"], blocks, strict=True):
+        assert network.subnet_of(scope_net)
+        assert diff["baseline_decision"] != diff["candidate_decision"]
+    for i, left in enumerate(blocks):
+        for right in blocks[i + 1:]:
+            assert not left.overlaps(right)
+
+    # Every differing address is covered by exactly one block; every address
+    # covered by a block really does change, with the reported decisions.
+    covered = [False] * len(addresses)
+    for diff, network in zip(result["differences"], blocks, strict=True):
+        for index, host in enumerate(all_hosts):
+            if host in network:
+                assert not covered[index]
+                covered[index] = True
+                assert base_point[index] == diff["baseline_decision"]
+                assert cand_point[index] == diff["candidate_decision"]
+    for index, changed in enumerate(
+        b != c for b, c in zip(base_point, cand_point)
+    ):
+        assert covered[index] == changed
+
+    # Totals match the per-address enumeration.
+    totals = {key: 0 for key in TRANSITION_KEYS}
+    for base, cand in zip(base_point, cand_point):
+        if base != cand:
+            totals[f"{base}->{cand}"] += 1
+    assert {key: int(value) for key, value in
+            result["transition_counts"].items()} == totals
+
+    # Minimality: no output pair forms two complete siblings of one parent
+    # with the same transition (those would have been merged).
+    for diff, network in zip(result["differences"], blocks, strict=True):
+        if network.prefixlen == 0:
+            continue
+        parent = network.supernet()
+        same_label_siblings = [
+            other for other_diff, other in zip(result["differences"], blocks)
+            if other != network and other.subnet_of(parent)
+            and other.prefixlen == network.prefixlen
+            and (other_diff["baseline_decision"],
+                 other_diff["candidate_decision"])
+            == (diff["baseline_decision"], diff["candidate_decision"])
+        ]
+        assert not (
+            len(same_label_siblings) == 1
+            and set(parent.subnets()) <= set(blocks)
+        )
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_compare_matches_pointwise_evaluation_ipv4(seed):
+    rng = random.Random(2000 + seed)
+    prefixlen = rng.randint(26, 29)  # <= /29 keeps enumeration cheap
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 5)):
+            length = rng.randint(prefixlen - 2, 32)
+            base = rng.randrange(2 ** 32)
+            addr = (base >> (32 - length)) << (32 - length)
+            items.append(str(ipaddress.IPv4Network((addr, length))))
+        return items
+
+    scope_addr = (rng.randrange(2 ** 32) >> (32 - prefixlen)) << (32 - prefixlen)
+    scope = str(ipaddress.IPv4Network((scope_addr, prefixlen)))
+    _assert_compare_exhaustive(
+        scope, random_list(), random_list(), random_list(), random_list()
+    )
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_compare_matches_pointwise_evaluation_ipv6(seed):
+    rng = random.Random(3000 + seed)
+    # Tiny /124-ish scopes under 2001:db8:: keep host enumeration cheap.
+    prefixlen = rng.randint(122, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 4)):
+            length = rng.randint(prefixlen - 2, 128)
+            host = rng.randrange(2 ** (128 - prefixlen))
+            root = base + (host & ~((1 << (128 - prefixlen)) - 1))
+            addr = (root >> (128 - length)) << (128 - length)
+            items.append(str(ipaddress.IPv6Network((addr, length))))
+        return items
+
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope_addr = (base + host) & ~((1 << (128 - prefixlen)) - 1)
+    scope = str(ipaddress.IPv6Network((scope_addr, prefixlen)))
+    _assert_compare_exhaustive(
+        scope, random_list(), random_list(), random_list(), random_list()
+    )
+
+
+# --------------------------------------------------------------------------
+# audit-rules: per-rule impact classification inside one scope
+# --------------------------------------------------------------------------
+
+
+def _entry(side, index, cidr, status, witness=None, shadowed_by=None):
+    result = {"side": side, "index": index, "cidr": cidr, "status": status}
+    if status == "effective":
+        result["witness"] = witness
+    elif status == "shadowed":
+        result["shadowed_by"] = shadowed_by
+    return result
+
+
+def test_audit_effective_rules_report_smallest_witness():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24"],
+        ["10.0.0.128/25"],
+    )
+    # The allow wins the lower half: smallest address 10.0.0.0.
+    assert result["allow"] == [
+        _entry("allow", 0, "10.0.0.0/24", "effective", witness="10.0.0.0")
+    ]
+    assert result["deny"] == [
+        _entry("deny", 0, "10.0.0.128/25", "effective", witness="10.0.0.128")
+    ]
+
+
+def test_audit_witness_is_smallest_winning_piece_not_cidr_start():
+    # The denies eat the lower two quarters of the allow /24; the allow's
+    # winning region starts at 10.0.0.128, which must be the witness rather
+    # than the rule's own network address 10.0.0.0.
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24"],
+        ["10.0.0.0/26", "10.0.0.64/26"],
+    )
+    assert result["allow"] == [
+        _entry("allow", 0, "10.0.0.0/24", "effective", witness="10.0.0.128")
+    ]
+
+
+def test_audit_equal_length_deny_shadows_allow():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/25"],
+        ["10.0.0.0/25"],
+    )
+    assert result["allow"] == [
+        _entry("allow", 0, "10.0.0.0/25", "shadowed",
+               shadowed_by=[{"side": "deny", "index": 0}])
+    ]
+    assert result["deny"] == [
+        _entry("deny", 0, "10.0.0.0/25", "effective", witness="10.0.0.0")
+    ]
+
+
+def test_audit_duplicate_same_side_rules_keep_earliest_priority():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/25", "10.0.0.0/25"],
+        [],
+    )
+    # The earlier copy wins; the later duplicate is shadowed by index 0.
+    assert result["allow"][0] == _entry(
+        "allow", 0, "10.0.0.0/25", "effective", witness="10.0.0.0")
+    assert result["allow"][1] == _entry(
+        "allow", 1, "10.0.0.0/25", "shadowed",
+        shadowed_by=[{"side": "allow", "index": 0}])
+
+
+def test_audit_shadowed_by_collects_distinct_winning_rules():
+    # The broad /24 allow wins nowhere: deny /25 takes the lower half, the
+    # more specific allow /26 takes one quarter of the upper half, and deny
+    # 192/26 takes the remaining quarter.
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.128/26"],
+        ["10.0.0.0/25", "10.0.0.192/26"],
+    )
+    assert result["allow"][0] == _entry(
+        "allow", 0, "10.0.0.0/24", "shadowed",
+        shadowed_by=[{"side": "allow", "index": 1},
+                     {"side": "deny", "index": 0},
+                     {"side": "deny", "index": 1}])
+    assert result["allow"][1] == _entry(
+        "allow", 1, "10.0.0.128/26", "effective", witness="10.0.0.128")
+    assert result["deny"][0] == _entry(
+        "deny", 0, "10.0.0.0/25", "effective", witness="10.0.0.0")
+    assert result["deny"][1] == _entry(
+        "deny", 1, "10.0.0.192/26", "effective", witness="10.0.0.192")
+
+
+def test_audit_dead_rules_never_appear_as_shadowers():
+    # deny/25 is itself shadowed everywhere by two /26 denies; it must still
+    # classify as shadowed (it never wins), and only the actual winners may
+    # appear in anyone's shadowed_by.
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.0.0.0/25"],
+        ["10.0.0.0/25", "10.0.0.0/26", "10.0.0.64/26"],
+    )
+    assert result["deny"][0]["status"] == "shadowed"
+    assert result["deny"][0]["shadowed_by"] == [
+        {"side": "deny", "index": 1}, {"side": "deny", "index": 2}]
+    allow_shadowers = {
+        (ref["side"], ref["index"])
+        for ref in result["allow"][0]["shadowed_by"]
+    }
+    assert ("deny", 0) not in allow_shadowers
+    assert allow_shadowers == {("deny", 1), ("deny", 2)}
+
+
+def test_audit_disjoint_rules_are_out_of_scope():
+    result = audit_rules(
+        "10.0.0.0/24",
+        ["10.1.0.0/16"],
+        ["192.0.2.0/24"],
+    )
+    assert result["allow"] == [
+        _entry("allow", 0, "10.1.0.0/16", "out_of_scope")]
+    assert result["deny"] == [
+        _entry("deny", 0, "192.0.2.0/24", "out_of_scope")]
+
+
+def test_audit_broader_than_scope_entry_is_effective():
+    # A rule containing the whole scope is analyzed on the clipped region.
+    result = audit_rules("10.0.0.0/25", ["10.0.0.0/16"], [])
+    assert result["allow"] == [
+        _entry("allow", 0, "10.0.0.0/16", "effective", witness="10.0.0.0")]
+
+
+def test_audit_bare_address_entries():
+    result = audit_rules(
+        "10.0.0.0/30",
+        ["10.0.0.0", "10.0.0.1"],
+        ["10.0.0.1"],
+    )
+    assert result["allow"][0] == _entry(
+        "allow", 0, "10.0.0.0/32", "effective", witness="10.0.0.0")
+    assert result["allow"][1] == _entry(
+        "allow", 1, "10.0.0.1/32", "shadowed",
+        shadowed_by=[{"side": "deny", "index": 0}])
+    assert result["deny"][0] == _entry(
+        "deny", 0, "10.0.0.1/32", "effective", witness="10.0.0.1")
+
+
+def test_audit_ipv6_compressed_witness():
+    result = audit_rules(
+        "2001:db8::/120",
+        ["2001:db8::/120"],
+        ["2001:db8::/121"],
+    )
+    # The /121 deny covers 0..127; the allow wins the upper half starting at
+    # 0x80.  Witnesses use the standard compressed textual representation.
+    assert result["allow"][0] == _entry(
+        "allow", 0, "2001:db8::/120", "effective",
+        witness="2001:db8::80")
+    assert result["deny"][0] == _entry(
+        "deny", 0, "2001:db8::/121", "effective", witness="2001:db8::")
+
+
+def test_audit_empty_rules():
+    result = audit_rules("10.0.0.0/24", [], [])
+    assert result == {"allow": [], "deny": []}
+
+
+def test_audit_input_order_and_indices_preserved():
+    allow = ["10.0.0.128/25", "10.0.0.0/24", "10.0.0.0/25"]
+    deny = ["10.1.0.0/16", "10.0.0.0/25"]
+    result = audit_rules("10.0.0.0/24", allow, deny)
+    assert [item["index"] for item in result["allow"]] == [0, 1, 2]
+    assert [item["cidr"] for item in result["allow"]] == allow
+    assert [item["index"] for item in result["deny"]] == [0, 1]
+    assert [item["cidr"] for item in result["deny"]] == deny
+
+
+# Pointwise reference model for property tests: brute-force the winning rule
+# at every address (small scopes only), without any partition logic.
+_AUDIT_SIDE_RANK = {"allow": 0, "deny": 1}
+
+
+def _audit_brute_force(scope_raw, allow_raw, deny_raw):
+    scope = ipaddress.ip_network(scope_raw)
+    rules = [
+        (i, ipaddress.ip_network(item), "allow") for i, item in enumerate(allow_raw)
+    ]
+    rules += [
+        (i, ipaddress.ip_network(item), "deny") for i, item in enumerate(deny_raw)
+    ]
+    start = int(scope.network_address)
+    won: dict[tuple[str, int], list[int]] = {}
+    shadowers: dict[tuple[str, int], set[tuple[str, int]]] = {}
+    covered: set[tuple[str, int]] = set()
+    for index, _, side in rules:
+        won[(side, index)] = []
+        shadowers[(side, index)] = set()
+
+    for offset in range(scope.num_addresses):
+        address_int = start + offset
+        winner: tuple[str, int] | None = None
+        best_key = None
+        active: list[tuple[str, int]] = []
+        for index, network, side in rules:
+            low = int(network.network_address)
+            high = low + network.num_addresses - 1
+            if network.version != scope.version or not low <= address_int <= high:
+                continue
+            active.append((side, index))
+            key = (network.prefixlen, _AUDIT_SIDE_RANK[side], -index)
+            if best_key is None or key > best_key:
+                best_key, winner = key, (side, index)
+        for reference in active:
+            covered.add(reference)
+            if winner == reference:
+                won[reference].append(address_int)
+            elif winner is not None:
+                shadowers[reference].add(winner)
+
+    output = {"allow": [], "deny": []}
+    for side, raw_list in (("allow", allow_raw), ("deny", deny_raw)):
+        for index, item in enumerate(raw_list):
+            reference = (side, index)
+            if reference not in covered:
+                status = {"status": "out_of_scope"}
+            elif won[reference]:
+                witness = str(ipaddress.ip_address(min(won[reference])))
+                status = {"status": "effective", "witness": witness}
+            else:
+                status = {
+                    "status": "shadowed",
+                    "shadowed_by": [
+                        {"side": s, "index": i}
+                        for s, i in sorted(shadowers[reference])
+                    ],
+                }
+            output[side].append({
+                "side": side, "index": index,
+                "cidr": str(ipaddress.ip_network(item)), **status,
+            })
+    return output
+
+
+def _assert_audit_matches_brute_force(scope, allow, deny):
+    expected = _audit_brute_force(scope, allow, deny)
+    actual = audit_rules(scope, allow, deny)
+    assert actual == expected
+
+
+@pytest.mark.parametrize("seed", range(120))
+def test_audit_matches_pointwise_brute_force_ipv4(seed):
+    rng = random.Random(6000 + seed)
+    prefixlen = rng.randint(26, 29)
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 6)):
+            length = rng.randint(prefixlen - 2, 32)
+            addr = (rng.randrange(2 ** 32) >> (32 - length)) << (32 - length)
+            items.append(str(ipaddress.IPv4Network((addr, length))))
+        # Occasionally duplicate an entry to exercise stable priorities.
+        if items and rng.random() < 0.4:
+            items.append(items[rng.randrange(len(items))])
+        return items
+
+    scope_addr = (rng.randrange(2 ** 32) >> (32 - prefixlen)) << (32 - prefixlen)
+    scope = str(ipaddress.IPv4Network((scope_addr, prefixlen)))
+    _assert_audit_matches_brute_force(scope, random_list(), random_list())
+
+
+@pytest.mark.parametrize("seed", range(48))
+def test_audit_matches_pointwise_brute_force_ipv6(seed):
+    rng = random.Random(7000 + seed)
+    prefixlen = rng.randint(122, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 5)):
+            length = rng.randint(prefixlen - 2, 128)
+            host = rng.randrange(2 ** (128 - prefixlen))
+            root = base + (host & ~((1 << (128 - prefixlen)) - 1))
+            addr = (root >> (128 - length)) << (128 - length)
+            items.append(str(ipaddress.IPv6Network((addr, length))))
+        if items and rng.random() < 0.4:
+            items.append(items[rng.randrange(len(items))])
+        return items
+
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope_addr = (base + host) & ~((1 << (128 - prefixlen)) - 1)
+    scope = str(ipaddress.IPv6Network((scope_addr, prefixlen)))
+    _assert_audit_matches_brute_force(scope, random_list(), random_list())
+
+
+def test_audit_does_not_enumerate_large_scopes():
+    # A /0 IPv6 scope must finish instantly: any address enumeration of
+    # 2**128 addresses would never return.  Inside the allow /32 the deny
+    # /48 wins its quarter, so the allow's smallest winning piece is the
+    # following /48 at 2001:db8:1::.
+    result = audit_rules("::/0", ["2001:db8::/32"], ["2001:db8::/48"])
+    assert result["allow"][0]["status"] == "effective"
+    assert result["allow"][0]["witness"] == "2001:db8:1::"
+    assert result["deny"][0]["status"] == "effective"
+    assert result["deny"][0]["witness"] == "2001:db8::"
+    # Outside both entries the scope is unmatched, but both rules overlap it.
+    assert all(item["status"] != "out_of_scope"
+               for item in result["allow"] + result["deny"])
+
+
+# --------------------------------------------------------------------------
+# minimize-policy: minimum equivalent rule subset inside one scope
+# --------------------------------------------------------------------------
+
+_MINIMIZE_SIDE_RANK = {"allow": 0, "deny": 1}
+
+
+def test_minimize_drops_shadowed_and_out_of_scope_rules():
+    # deny /25 beats the equal-length allow /25 (index 1); the broad allow /24
+    # still wins the upper half; an out-of-scope deny is removed outright.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        ["10.0.0.0/25", "10.1.0.0/16"],
+    )
+    assert result == {
+        "retained": [
+            {"side": "allow", "index": 0, "cidr": "10.0.0.0/24",
+             "witness": "10.0.0.128"},
+            {"side": "deny", "index": 0, "cidr": "10.0.0.0/25",
+             "witness": "10.0.0.0"},
+        ],
+        "removed": [
+            {"side": "allow", "index": 1, "cidr": "10.0.0.0/25"},
+            {"side": "deny", "index": 1, "cidr": "10.1.0.0/16"},
+        ],
+    }
+
+
+def test_minimize_lex_tie_prefers_smaller_allow_index():
+    # Both the broad allow /24 and the narrow allow /25 combine with the deny
+    # /25 into a size-2 solution; (allow, 0) wins the lexicographic tie.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.0/24", "10.0.0.0/25"],
+        ["10.0.0.128/25"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+    assert result["removed"] == [
+        {"side": "allow", "index": 1, "cidr": "10.0.0.0/25"},
+    ]
+
+
+def test_minimize_lex_tie_across_deny_indices():
+    # The broad deny /24 and the narrower deny /26 both keep the single deny
+    # quarter beside the two /26 allows; the earlier deny index wins.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.0/26", "10.0.0.128/25"],
+        ["10.0.0.0/24", "10.0.0.64/26"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("allow", 1), ("deny", 0),
+    ]
+    assert result["removed"] == [
+        {"side": "deny", "index": 1, "cidr": "10.0.0.64/26"},
+    ]
+    # Witness of the broad deny is the first quarter it actually wins under
+    # the reduced policy (0/26 allow wins the lowest quarter).
+    deny0 = next(
+        item for item in result["retained"]
+        if item["side"] == "deny" and item["index"] == 0
+    )
+    assert deny0["witness"] == "10.0.0.64"
+
+
+def test_minimize_duplicate_entries_keep_earliest_copy():
+    # Two identical denies: later copy is shadowed by the earlier one.
+    result = minimize_policy(
+        "10.0.0.0/24",
+        [],
+        ["10.0.0.0/24", "10.0.0.0/24"],
+    )
+    assert result["retained"] == [
+        {"side": "deny", "index": 0, "cidr": "10.0.0.0/24",
+         "witness": "10.0.0.0"},
+    ]
+    assert result["removed"] == [
+        {"side": "deny", "index": 1, "cidr": "10.0.0.0/24"},
+    ]
+
+
+def test_minimize_equal_length_deny_makes_allow_fully_removable():
+    result = minimize_policy(
+        "10.0.0.0/24",
+        ["10.0.0.128/25"],
+        ["10.0.0.128/25"],
+    )
+    assert result["retained"] == [
+        {"side": "deny", "index": 0, "cidr": "10.0.0.128/25",
+         "witness": "10.0.0.128"},
+    ]
+    assert result["removed"] == [
+        {"side": "allow", "index": 0, "cidr": "10.0.0.128/25"},
+    ]
+
+
+def test_minimize_empty_policy_retains_nothing():
+    assert minimize_policy("10.0.0.0/24", [], []) == {
+        "retained": [], "removed": [],
+    }
+
+
+def test_minimize_references_follow_original_input_order():
+    # Allows are emitted by index before denies, in both lists.
+    result = minimize_policy(
+        "10.0.0.0/30",
+        ["10.0.0.0/32", "10.0.0.1/32", "10.0.0.2/32"],
+        ["10.0.0.3/32"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("allow", 1), ("allow", 2), ("deny", 0),
+    ]
+    assert [item["witness"] for item in result["retained"]] == [
+        "10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3",
+    ]
+    assert result["removed"] == []
+
+
+def test_minimize_ipv6_witnesses_and_huge_scope():
+    result = minimize_policy(
+        "2001:db8::/120",
+        ["2001:db8::/120"],
+        ["2001:db8::/121"],
+    )
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+    witnesses = {
+        (item["side"], item["index"]): item["witness"]
+        for item in result["retained"]
+    }
+    assert witnesses[("allow", 0)] == "2001:db8::80"
+    assert witnesses[("deny", 0)] == "2001:db8::"
+
+    # ::/0 must complete without enumerating addresses.
+    result = minimize_policy("::/0", ["2001:db8::/32"], ["2001:db8::/48"])
+    assert [(item["side"], item["index"]) for item in result["retained"]] == [
+        ("allow", 0), ("deny", 0),
+    ]
+
+
+def _minimize_brute_force(scope_raw, allow_raw, deny_raw):
+    """Reference: enumerate every subset and keep the minimum, lex-smallest."""
+    rules = [
+        (index, "allow", item) for index, item in enumerate(allow_raw)
+    ] + [
+        (index, "deny", item) for index, item in enumerate(deny_raw)
+    ]
+
+    def decisions(allow_subset, deny_subset):
+        return [
+            item["decision"]
+            for item in evaluate(allow_subset, deny_subset, _scope_addresses)
+        ]
+
+    scope = ipaddress.ip_network(scope_raw)
+    start = int(scope.network_address)
+    _scope_addresses = [
+        str(ipaddress.ip_address(start + offset))
+        for offset in range(scope.num_addresses)
+    ]
+    target = decisions(list(allow_raw), list(deny_raw))
+
+    best = None
+    for mask in range(1 << len(rules)):
+        allow_subset = [
+            cidr for pos, (_i, side, cidr) in enumerate(rules)
+            if side == "allow" and mask & (1 << pos)
+        ]
+        deny_subset = [
+            cidr for pos, (_i, side, cidr) in enumerate(rules)
+            if side == "deny" and mask & (1 << pos)
+        ]
+        if decisions(allow_subset, deny_subset) != target:
+            continue
+        key = sorted(
+            (side, index)
+            for pos, (index, side, _cidr) in enumerate(rules)
+            if mask & (1 << pos)
+        )
+        if best is None or (len(key), key) < (len(best), best):
+            best = key
+    return best
+
+
+def _assert_minimize_matches_brute_force(scope, allow, deny):
+    result = minimize_policy(scope, allow, deny)
+    retained = [
+        (item["side"], item["index"]) for item in result["retained"]
+    ]
+    assert retained == _minimize_brute_force(scope, allow, deny)
+
+    # retained + removed partition every input reference exactly once.
+    removed = [(item["side"], item["index"]) for item in result["removed"]]
+    expected = [
+        ("allow", index) for index in range(len(allow))
+    ] + [
+        ("deny", index) for index in range(len(deny))
+    ]
+    assert sorted(retained + removed) == sorted(expected)
+    # Both lists are in canonical original-input order (allow then deny).
+    assert retained == sorted(retained)
+    assert removed == sorted(removed)
+
+    # Every witness is the numerically smallest winning address of its rule
+    # under the reduced policy, checked pointwise with original indices.
+    scope_net = ipaddress.ip_network(scope)
+    reduced_entries = [
+        (item["index"], ipaddress.ip_network(
+            (allow if item["side"] == "allow" else deny)[item["index"]]
+        ), item["side"])
+        for item in result["retained"]
+    ]
+    smallest: dict[tuple[str, int], int] = {}
+    for offset in range(scope_net.num_addresses):
+        address = scope_net.network_address + offset
+        winner = None
+        for index, network, side in reduced_entries:
+            if address in network:
+                key = (network.prefixlen, _MINIMIZE_SIDE_RANK[side], -index)
+                if winner is None or key > winner[0]:
+                    winner = (key, side, index)
+        if winner is not None:
+            rule_key = (winner[1], winner[2])
+            value = int(address)
+            if rule_key not in smallest or value < smallest[rule_key]:
+                smallest[rule_key] = value
+    for item in result["retained"]:
+        key = (item["side"], item["index"])
+        assert item["witness"] == str(ipaddress.ip_address(smallest[key]))
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_minimize_matches_brute_force_ipv4(seed):
+    rng = random.Random(8000 + seed)
+    prefixlen = rng.randint(26, 29)
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 6)):
+            length = rng.randint(prefixlen - 2, 32)
+            addr = (rng.randrange(2 ** 32) >> (32 - length)) << (32 - length)
+            items.append(str(ipaddress.IPv4Network((addr, length))))
+        if items and rng.random() < 0.4:
+            items.append(items[rng.randrange(len(items))])
+        return items
+
+    scope_addr = (rng.randrange(2 ** 32) >> (32 - prefixlen)) << (32 - prefixlen)
+    scope = str(ipaddress.IPv4Network((scope_addr, prefixlen)))
+    allow, deny = random_list(), random_list()
+    if len(allow) + len(deny) <= 16:
+        _assert_minimize_matches_brute_force(scope, allow, deny)
+
+
+@pytest.mark.parametrize("seed", range(32))
+def test_minimize_matches_brute_force_ipv6(seed):
+    rng = random.Random(9000 + seed)
+    prefixlen = rng.randint(122, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+
+    def random_list():
+        items = []
+        for _ in range(rng.randint(0, 5)):
+            length = rng.randint(prefixlen - 2, 128)
+            host = rng.randrange(2 ** (128 - prefixlen))
+            root = base + (host & ~((1 << (128 - prefixlen)) - 1))
+            addr = (root >> (128 - length)) << (128 - length)
+            items.append(str(ipaddress.IPv6Network((addr, length))))
+        if items and rng.random() < 0.4:
+            items.append(items[rng.randrange(len(items))])
+        return items
+
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope_addr = (base + host) & ~((1 << (128 - prefixlen)) - 1)
+    scope = str(ipaddress.IPv6Network((scope_addr, prefixlen)))
+    allow, deny = random_list(), random_list()
+    if len(allow) + len(deny) <= 16:
+        _assert_minimize_matches_brute_force(scope, allow, deny)
+
+
+def test_minimize_does_not_enumerate_large_scopes():
+    # A /0 IPv6 scope completes instantly: any per-address enumeration over
+    # 2**128 addresses could not return.
+    result = minimize_policy("::/0", ["2001:db8::/32"], ["2001:db8::/48"])
+    assert len(result["retained"]) == 2
+
+
+# --------------------------------------------------------------------------
+# allocate: lexicographically smallest non-overlapping subnet assignment
+# --------------------------------------------------------------------------
+
+
+def test_allocate_basic_lexicographic_order():
+    result = allocate(
+        "10.0.0.0/24", ["10.0.0.0/25"], [("b", 26), ("a", 26)]
+    )
+    assert result == {
+        "allocations": [
+            {"id": "b", "cidr": "10.0.0.128/26"},
+            {"id": "a", "cidr": "10.0.0.192/26"},
+        ],
+        "remaining": [],
+        "remaining_addresses": "0",
+    }
+
+
+def test_allocate_sequence_order_follows_requests_not_addresses():
+    # The lexicographic key is the address sequence in request order: the
+    # /26 goes to the lowest free block, the /25 takes what remains.
+    result = allocate("10.0.0.0/24", [], [("x", 26), ("y", 25)])
+    assert result["allocations"] == [
+        {"id": "x", "cidr": "10.0.0.0/26"},
+        {"id": "y", "cidr": "10.0.0.128/25"},
+    ]
+    assert result["remaining"] == ["10.0.0.64/26"]
+
+
+def test_allocate_backtracks_to_lexicographic_minimum():
+    # First-fit for "small" (10.0.0.0/25 or 10.0.0.128/25) strands the /24;
+    # the only complete plans put "small" at 10.0.1.128/25.
+    result = allocate(
+        "10.0.0.0/23", ["10.0.1.0/25"], [("small", 25), ("big", 24)]
+    )
+    assert [item["cidr"] for item in result["allocations"]] == [
+        "10.0.1.128/25", "10.0.0.0/24",
+    ]
+    assert result["remaining"] == []
+
+
+def test_allocate_infeasible_returns_none():
+    # Two /25s beside an occupied /25.
+    assert allocate(
+        "10.0.0.0/24", ["10.0.0.0/25"], [("x", 25), ("y", 25)]
+    ) is None
+    # A prefix shorter than the scope prefix can never fit inside it.
+    assert allocate("10.0.0.0/24", [], [("wan", 16)]) is None
+    # Scope fully occupied.
+    assert allocate("10.0.0.0/24", ["10.0.0.0/24"], [("x", 32)]) is None
+    # Fragmentation: two /26 holes cannot host a /25.
+    assert allocate(
+        "10.0.0.0/24",
+        ["10.0.0.0/26", "10.0.0.128/26"],
+        [("x", 25)],
+    ) is None
+
+
+def test_allocate_empty_requests_returns_free_space():
+    result = allocate("10.0.0.0/24", ["10.0.0.0/25"], [])
+    assert result == {
+        "allocations": [],
+        "remaining": ["10.0.0.128/25"],
+        "remaining_addresses": "128",
+    }
+
+
+def test_allocate_host_prefix_scope_and_request():
+    result = allocate("10.0.0.5/32", [], [("host", 32)])
+    assert result["allocations"] == [{"id": "host", "cidr": "10.0.0.5/32"}]
+    assert result["remaining"] == []
+    assert result["remaining_addresses"] == "0"
+
+
+def test_allocate_ipv6():
+    result = allocate(
+        "2001:db8::/126", ["2001:db8::1/128"], [("node", 128)]
+    )
+    assert result["allocations"] == [{"id": "node", "cidr": "2001:db8::/128"}]
+    assert result["remaining"] == ["2001:db8::2/127"]
+    assert result["remaining_addresses"] == "2"
+
+
+def test_allocate_remaining_is_minimal_and_non_overlapping():
+    result = allocate(
+        "10.0.0.0/24",
+        ["10.0.0.64/26", "10.0.0.128/26"],
+        [("first", 26)],
+    )
+    assert result["allocations"] == [{"id": "first", "cidr": "10.0.0.0/26"}]
+    assert result["remaining"] == ["10.0.0.192/26"]
+    assert result["remaining_addresses"] == "64"
+
+
+def _brute_force_allocate(scope_raw, occupied_raw, requests):
+    """Reference: enumerate every feasible assignment and keep the one whose
+    network-address sequence (in request order) is lexicographically minimal.
+    """
+    scope = ipaddress.ip_network(scope_raw)
+    occupied = [ipaddress.ip_network(item) for item in occupied_raw]
+    max_bits = 32 if scope.version == 4 else 128
+    free = _normalize_family([scope], occupied, type(scope))
+
+    def candidates(free_nets, prefixlen):
+        size = 1 << (max_bits - prefixlen)
+        for net in free_nets:
+            if net.prefixlen <= prefixlen:
+                base = int(net.network_address)
+                for offset in range(0, net.num_addresses, size):
+                    yield type(net)((base + offset, prefixlen))
+
+    def subtract(free_nets, block):
+        out = []
+        for net in free_nets:
+            if block.subnet_of(net):
+                out.extend(net.address_exclude(block))
+            else:
+                out.append(net)
+        return out
+
+    best = None
+
+    def rec(free_nets, depth, acc):
+        nonlocal best
+        if depth == len(requests):
+            key = tuple(int(net.network_address) for net in acc)
+            if best is None or key < best[0]:
+                best = (key, list(acc))
+            return
+        for candidate in candidates(free_nets, requests[depth][1]):
+            rec(subtract(free_nets, candidate), depth + 1, acc + [candidate])
+
+    rec(free, 0, [])
+    return None if best is None else best[1]
+
+
+def _assert_allocate_matches_brute_force(scope, occupied, requests):
+    occupied_raw = [str(net) for net in occupied]
+    expected = _brute_force_allocate(str(scope), occupied_raw, requests)
+    result = allocate(str(scope), occupied_raw, requests)
+
+    if expected is None:
+        assert result is None
+        return
+
+    assert result is not None
+    chosen = [
+        ipaddress.ip_network(item["cidr"]) for item in result["allocations"]
+    ]
+    # Exactly the lexicographically smallest feasible sequence, with the
+    # request ids attached in request order.
+    assert chosen == expected
+    assert [item["id"] for item in result["allocations"]] == [
+        request_id for request_id, _ in requests
+    ]
+    # Sanity: allocations lie in scope, avoid occupied, and are disjoint.
+    for (_, prefix_length), network in zip(requests, chosen, strict=True):
+        assert network.subnet_of(scope)
+        assert network.prefixlen == prefix_length
+        assert not any(network.overlaps(net) for net in occupied)
+    for i, left in enumerate(chosen):
+        for right in chosen[i + 1:]:
+            assert not left.overlaps(right)
+    # Remaining space equals scope - occupied - allocations, minimally.
+    leftover = _normalize_family([scope], [*occupied, *chosen], type(scope))
+    assert result["remaining"] == [str(net) for net in leftover]
+    assert int(result["remaining_addresses"]) == sum(
+        net.num_addresses for net in leftover
+    )
+
+
+def _random_occupied(rng, scope, max_bits):
+    """Random, mutually non-overlapping strict subnets of ``scope``."""
+    occupied = []
+    for _ in range(rng.randint(0, 3)):
+        prefixlen = rng.randint(scope.prefixlen, min(scope.prefixlen + 2, max_bits))
+        slot = rng.randrange(1 << (prefixlen - scope.prefixlen))
+        addr = int(scope.network_address) + slot * (1 << (max_bits - prefixlen))
+        net = type(scope)((addr, prefixlen))
+        if all(not net.overlaps(other) for other in occupied):
+            occupied.append(net)
+    return occupied
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_allocate_matches_brute_force_ipv4(seed):
+    rng = random.Random(4000 + seed)
+    prefixlen = rng.randint(28, 30)  # small scopes keep enumeration cheap
+    base = rng.randrange(2 ** 32) & ~((1 << (32 - prefixlen)) - 1)
+    scope = ipaddress.IPv4Network((base, prefixlen))
+    occupied = _random_occupied(rng, scope, 32)
+    requests = [
+        (f"r{i}", rng.randint(prefixlen, 32))
+        for i in range(rng.randint(0, 3))
+    ]
+    _assert_allocate_matches_brute_force(scope, occupied, requests)
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_allocate_matches_brute_force_ipv6(seed):
+    rng = random.Random(5000 + seed)
+    prefixlen = rng.randint(124, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope = ipaddress.IPv6Network(
+        (base + (host << (128 - prefixlen)), prefixlen)
+    )
+    occupied = _random_occupied(rng, scope, 128)
+    requests = [
+        (f"r{i}", rng.randint(prefixlen, 128))
+        for i in range(rng.randint(0, 3))
+    ]
+    _assert_allocate_matches_brute_force(scope, occupied, requests)
