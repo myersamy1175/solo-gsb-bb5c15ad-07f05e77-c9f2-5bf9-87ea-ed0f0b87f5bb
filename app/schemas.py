@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.anonymize import parse_key_hex
 from app.policy import (
     MINIMIZE_POLICY_RULE_LIMIT,
     _MAX_PREFIXLEN,
@@ -438,5 +439,65 @@ class AllocateResponse(BaseModel):
         description=(
             "Total free addresses left in the scope, as a decimal string "
             "(IPv6 remainders exceed JSON's safe integer range)."
+        ),
+    )
+
+
+class AnonymizeRequest(BaseModel):
+    key_hex: str = Field(
+        description=(
+            "HMAC-SHA256 key as exactly 64 hexadecimal characters "
+            "(32 bytes / 256 bits); the mapping is stable per key."
+        ),
+    )
+    addresses: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Bare IPv4/IPv6 addresses to anonymize; CIDR notation is "
+            "rejected. Output follows this order."
+        ),
+    )
+    cidrs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Strict IPv4/IPv6 CIDRs to anonymize; host bits must be zero. "
+            "Output follows this order."
+        ),
+    )
+
+    @field_validator("key_hex")
+    @classmethod
+    def _validate_key(cls, value: str) -> str:
+        # Parse once here for validation; the endpoint re-parses the bytes.
+        parse_key_hex(value)
+        return value
+
+    @field_validator("addresses")
+    @classmethod
+    def _validate_address_list(cls, values: list[str]) -> list[str]:
+        # A ValueError raised here is turned by FastAPI into an HTTP 422
+        # response carrying the offending field and value.
+        for value in values:
+            parse_address(value)
+        return values
+
+    @field_validator("cidrs")
+    @classmethod
+    def _validate_cidr_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+
+class AnonymizeResponse(BaseModel):
+    addresses: list[str] = Field(
+        description=(
+            "Anonymized bare addresses, one per input address, in input order."
+        ),
+    )
+    cidrs: list[str] = Field(
+        description=(
+            "Canonical anonymized CIDRs, one per input CIDR, in input order; "
+            "each keeps the original prefix length with zeroed host bits."
         ),
     )

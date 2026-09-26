@@ -1,10 +1,11 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules, /minimize-policy and /allocate."""
+/audit-rules, /minimize-policy, /allocate and /anonymize."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
+from app.anonymize import anonymize
 from app.policy import (
     allocate,
     audit_rules,
@@ -17,6 +18,8 @@ from app.schemas import (
     AddressDecision,
     AllocateRequest,
     AllocateResponse,
+    AnonymizeRequest,
+    AnonymizeResponse,
     AuditRulesRequest,
     AuditRulesResponse,
     CompareRequest,
@@ -37,11 +40,13 @@ app = FastAPI(
         "match; diff two policy sets (baseline vs candidate) over a "
         "scope CIDR; audit each allow/deny rule for its real impact inside "
         "one scope; minimize an allow/deny list to the smallest subset "
-        "equivalent inside one scope; and allocate non-overlapping subnets "
+        "equivalent inside one scope; allocate non-overlapping subnets "
         "for a list of requests inside one scope, avoiding already-occupied "
-        "CIDRs."
+        "CIDRs; and prefix-preservingly anonymize bare IPv4/IPv6 addresses "
+        "and strict CIDRs under a 256-bit HMAC key for sharing address "
+        "lists."
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -508,3 +513,102 @@ def allocate_subnets(request: AllocateRequest) -> dict:
             ),
         )
     return result
+
+
+@app.post(
+    "/anonymize",
+    response_model=AnonymizeResponse,
+    tags=["anonymize"],
+    summary=(
+        "Prefix-preserving keyed anonymization of bare addresses and CIDRs"
+    ),
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "addresses_and_strict_cidrs": {
+                            "summary": (
+                                "Bare IPv4/IPv6 addresses and strict CIDRs; "
+                                "shared prefixes stay shared"
+                            ),
+                            "value": {
+                                "key_hex": (
+                                    "0123456789abcdef0123456789abcdef"
+                                    "0123456789abcdef0123456789abcdef"
+                                ),
+                                "addresses": [
+                                    "192.168.0.1",
+                                    "192.168.0.2",
+                                    "2001:db8::1",
+                                ],
+                                "cidrs": [
+                                    "10.0.0.0/8",
+                                    "192.168.0.0/24",
+                                    "2001:db8::/32",
+                                ],
+                            },
+                        },
+                        "bad_key": {
+                            "summary": "key_hex is not 64 hex chars -> HTTP 422",
+                            "value": {"key_hex": "deadbeef", "addresses": []},
+                        },
+                        "cidr_with_host_bits": {
+                            "summary": "Host bits set in a CIDR -> HTTP 422",
+                            "value": {
+                                "key_hex": (
+                                    "0123456789abcdef0123456789abcdef"
+                                    "0123456789abcdef0123456789abcdef"
+                                ),
+                                "cidrs": ["10.0.0.1/24"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "Anonymized addresses and canonical CIDR images, each list "
+                "keeping its input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "addresses_and_strict_cidrs": {
+                            "summary": (
+                                "192.168.0.1/2 still share a /30; the /8 "
+                                "stays a /8"
+                            ),
+                            "value": {
+                                "addresses": [
+                                    "236.222.104.188",
+                                    "236.222.104.191",
+                                    "d5af:46c8:beb3:e56d:c681:ca26:c4a4:9e2a",
+                                ],
+                                "cidrs": [
+                                    "77.0.0.0/8",
+                                    "236.222.104.0/24",
+                                    "d5af:46c8::/32",
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "key_hex is not exactly 64 hexadecimal characters, an "
+                "address is invalid or uses CIDR notation, or a CIDR is "
+                "invalid or has host bits set."
+            ),
+        },
+    },
+)
+def anonymize_lists(request: AnonymizeRequest) -> dict:
+    return anonymize(request.key_hex, request.addresses, request.cidrs)

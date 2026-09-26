@@ -86,6 +86,7 @@ def test_doc_and_openapi_available():
     spec = client.get("/openapi.json").json()
     assert "/normalize" in spec["paths"]
     assert "/evaluate" in spec["paths"]
+    assert "/anonymize" in spec["paths"]
 
 
 # --------------------------------------------------------------------------
@@ -1031,3 +1032,208 @@ def test_allocate_is_documented_in_openapi():
     assert set(schema["properties"]) == {
         "allocations", "remaining", "remaining_addresses",
     }
+
+
+# --------------------------------------------------------------------------
+# POST /anonymize
+# --------------------------------------------------------------------------
+
+ANON_KEY = "0123456789abcdef" * 4
+
+
+def test_anonymize_basic_addresses_and_cidrs():
+    response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": ANON_KEY,
+            "addresses": [
+                "192.168.0.1", "192.168.0.2", "2001:db8::1",
+            ],
+            "cidrs": ["10.0.0.0/8", "192.168.0.0/24", "2001:db8::/32"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "addresses": [
+            "236.222.104.188",
+            "236.222.104.191",
+            "d5af:46c8:beb3:e56d:c681:ca26:c4a4:9e2a",
+        ],
+        "cidrs": ["77.0.0.0/8", "236.222.104.0/24", "d5af:46c8::/32"],
+    }
+
+
+def test_anonymize_empty_lists():
+    response = client.post("/anonymize", json={"key_hex": ANON_KEY})
+    assert response.status_code == 200
+    assert response.json() == {"addresses": [], "cidrs": []}
+
+
+def test_anonymize_stable_under_same_key():
+    body = {
+        "key_hex": ANON_KEY,
+        "addresses": ["10.0.0.1", "10.0.0.2"],
+        "cidrs": ["10.0.0.0/24"],
+    }
+    first = client.post("/anonymize", json=body)
+    second = client.post("/anonymize", json=body)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+
+
+def test_anonymize_preserves_longest_common_prefix():
+    response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": ANON_KEY,
+            "addresses": ["192.168.0.1", "192.168.0.2"],
+        },
+    )
+    assert response.status_code == 200
+    # .1 (..000001) and .2 (..000010) share a /30; their images must too.
+    import ipaddress
+
+    left, right = (
+        ipaddress.ip_address(value)
+        for value in response.json()["addresses"]
+    )
+    assert left in ipaddress.ip_network("236.222.104.188/30", strict=False)
+    assert right in ipaddress.ip_network("236.222.104.188/30", strict=False)
+    assert left != right
+
+
+def test_anonymize_distinct_addresses_never_collide():
+    response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": ANON_KEY,
+            "addresses": [
+                "10.0.0.1", "10.0.0.2", "192.168.0.1", "127.0.0.1",
+                "2001:db8::1", "2001:db8::2", "::1",
+            ],
+        },
+    )
+    assert response.status_code == 200
+    values = response.json()["addresses"]
+    assert len(set(values)) == len(values)
+
+
+def test_anonymize_keeps_input_order():
+    response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": ANON_KEY,
+            "addresses": ["2001:db8::1", "10.0.0.1", "192.168.0.5"],
+            "cidrs": ["2001:db8::/32", "10.0.0.0/24"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    reversed_response = client.post(
+        "/anonymize",
+        json={
+            "key_hex": ANON_KEY,
+            "addresses": ["192.168.0.5", "10.0.0.1", "2001:db8::1"],
+            "cidrs": ["10.0.0.0/24", "2001:db8::/32"],
+        },
+    ).json()
+    assert data["addresses"] == list(reversed(reversed_response["addresses"]))
+    assert data["cidrs"] == list(reversed(reversed_response["cidrs"]))
+
+
+def test_anonymize_cidr_is_canonical_with_zero_host_bits():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": ANON_KEY, "cidrs": ["10.0.0.0/24", "2001:db8::/32"]},
+    )
+    assert response.status_code == 200
+    import ipaddress
+
+    for text in response.json()["cidrs"]:
+        # strict=True raises if host bits are set.
+        ipaddress.ip_network(text, strict=True)
+
+
+def test_anonymize_invalid_key_returns_422():
+    for bad_key in ["", "abc", "g" * 64, "00" * 31, "ff" * 33]:
+        response = client.post(
+            "/anonymize",
+            json={"key_hex": bad_key, "addresses": ["10.0.0.1"]},
+        )
+        assert response.status_code == 422, bad_key
+        assert any(
+            err["loc"][-1] == "key_hex" for err in response.json()["detail"]
+        )
+
+
+def test_anonymize_missing_key_returns_422():
+    response = client.post("/anonymize", json={"addresses": ["10.0.0.1"]})
+    assert response.status_code == 422
+    assert any("key_hex" in err["loc"] for err in response.json()["detail"])
+
+
+def test_anonymize_wrong_key_type_returns_422():
+    response = client.post(
+        "/anonymize", json={"key_hex": 64, "addresses": []}
+    )
+    assert response.status_code == 422
+
+
+def test_anonymize_invalid_address_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": ANON_KEY, "addresses": ["10.0.0.1", "bogus"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "addresses" for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_cidr_notation_in_addresses_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": ANON_KEY, "addresses": ["10.0.0.1/32"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "addresses" for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_invalid_cidr_returns_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": ANON_KEY, "cidrs": ["not-a-cidr"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "cidrs" for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_cidr_host_bits_return_422():
+    response = client.post(
+        "/anonymize",
+        json={"key_hex": ANON_KEY, "cidrs": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "cidrs" for err in response.json()["detail"]
+    )
+
+
+def test_anonymize_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/anonymize" in spec["paths"]
+    operation = spec["paths"]["/anonymize"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "addresses_and_strict_cidrs" in examples
+    schema = spec["components"]["schemas"]["AnonymizeResponse"]
+    assert set(schema["properties"]) == {"addresses", "cidrs"}
+    request_schema = spec["components"]["schemas"]["AnonymizeRequest"]
+    assert set(request_schema["properties"]) == {
+        "key_hex", "addresses", "cidrs"}
